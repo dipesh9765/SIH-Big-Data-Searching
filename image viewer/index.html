@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="./css/style.css" />
+    <title>Image Viewer</title>
+  </head>
+  <body>
+    <div class="container">
+      <div class="image-container">
+        <div class="image"><img src="./imgs/ASH_5347.JPG" alt="img" /></div>
+        <div class="image"><img src="./imgs/ASH_6195.JPG" alt="img" /></div>
+        <div class="image"><img src="./imgs/ASH_6192.JPG" alt="img" /></div>
+        <div class="image"><img src="./imgs/ASH_6194.JPG" alt="img" /></div>
+        <div class="image"><img src="./imgs/ASH_6195.JPG" alt="img" /></div>
+        <div class="image"><img src="./imgs/ASH_6197.JPG" alt="img" /></div>
+      </div>    
+      <div class="popup-image">
+        <span>&times;</span>
+        <img src="./imgs/ASH_5347.JPG" alt="" />
+      </div>
+    </div>
+    <script>
+      document.querySelectorAll('.image-container img').forEach(image => {
+        image.onclick = () => {
+          document.querySelector('.popup-image').style.display = 'block'
+          document.querySelector('.popup-image img').src = image.getAttribute(
+            'src'
+          )
+        }
+      })
+      document.querySelector('.popup-image span').onclick = () => {
+        document.querySelector('.popup-image').style.display = 'none'
+      }
+    </script>
+  </body>
+</html>
