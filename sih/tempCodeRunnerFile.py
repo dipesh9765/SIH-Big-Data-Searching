@@ -1,2 +1,0 @@
-
-os.path.basename(fpat);
