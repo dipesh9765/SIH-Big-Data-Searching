@@ -1,0 +1,28 @@
+<%- include("header") -%>
+  <link rel="stylesheet" href="index.css">
+  </head>
+
+  <body>
+    <nav class="navbar">
+      <div class="container-fluid">
+        <a class="navbar-brand" href="#">
+          <img src="main-logo.png.png" alt="" width="30" height="24" class="d-inline-block align-text-top">
+          MP Police
+        </a>
+      </div>
+    </nav>
+    <div class="search">
+      <h1>Search Throughout the Database</h1>
+      <form action="/" method="post">
+        <div class="container">
+          <div class="form-group">
+            <div class="input-group shadow">
+              <span class="input-group-text px-3 text-muted"><i class="fas fa-image fa-lg"></i></span>
+              <input type="text" name="name" class="form-control form-control-lg" placeholder="Search" />
+              <input name="name" class="browse btn btn-primary px-4" type="submit" value="submit" />
+            </div>
+          </div>
+        </div>
+      </form>
+    </div>
+    <%- include("footer") -%>
