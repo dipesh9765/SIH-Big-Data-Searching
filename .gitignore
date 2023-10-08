@@ -1,0 +1,8 @@
+*.pth
+*.docx
+*.pdf
+*.jpg
+*.png
+node_modules
+models
+.env
