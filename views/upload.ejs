@@ -1,0 +1,18 @@
+<%- include("header") -%>
+    <link rel="stylesheet" href="uploadCSS.css">
+    </head>
+
+    <body>
+        <h1>BIG DATA SEARCHING</h1>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <div class="input-group mb-3">
+                <!-- <input type="file" name="file" />
+            <input type="submit" value="submit" /> -->
+                <input type="file" name="file" class="form-control" id="inputGroupFile02" />
+                <input class="input-group-text" type="submit" value="submit" for="inputGroupFile02" />
+            </div>
+        </form>
+        <br />
+        <br />
+        <br />
+        <%- include("footer") -%>
