@@ -1,7 +1,6 @@
 import math
 import sqlite3
 import threading
-from contextlib import closing
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path

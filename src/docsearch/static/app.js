@@ -39,7 +39,7 @@ async function refreshStats() {
     `${s.documents.toLocaleString()} documents · ${s.terms.toLocaleString()} terms · ` +
     `${s.postings.toLocaleString()} postings`;
   $("file").accept = s.accepted_extensions.join(",");
-  $("upload-msg").textContent =
+  $("accepted").textContent =
     `Accepted: ${s.accepted_extensions.join(" ")} · up to ${Math.round(s.max_upload_bytes / 2 ** 20)} MB`;
 }
 

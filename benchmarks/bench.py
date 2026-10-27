@@ -112,9 +112,12 @@ def main() -> None:
         doc_freq = Counter(t for text in corpus for t in {tok.term for tok in tokenize(text)})
         trials, correct = 0, 0
         for position in rng.sample(range(args.docs), min(args.queries, args.docs)):
-            terms = list(dict.fromkeys(t.term for t in tokenize(corpus[position])))
-            distinctive = sorted(terms, key=lambda t: (doc_freq[t], t))[:3]  # the 3 rarest terms
-            hits = index.search(" ".join(distinctive), mode="all", limit=1).hits
+            text = corpus[position]
+            # Query with the *words* of the 3 rarest terms, as a user would: stems are not
+            # idempotent ("roled" -> "role"), so feeding stems back in would not match.
+            words = {t.term: text[t.start : t.end] for t in tokenize(text)}
+            rarest = sorted(words, key=lambda term: (doc_freq[term], term))[:3]
+            hits = index.search(" ".join(words[t] for t in rarest), mode="all", limit=1).hits
             trials += 1
             correct += bool(hits) and hits[0].document.id == ids[position]
 

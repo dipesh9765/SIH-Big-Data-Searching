@@ -163,3 +163,23 @@ def test_encrypted_pdf_is_refused() -> None:
     writer.write(buffer)
     with pytest.raises(ExtractionError, match="encrypted"):
         extract_text("a.pdf", buffer.getvalue())
+
+
+def test_ocr_path_with_a_stubbed_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercises our image handling with real Pillow but a fake Tesseract call.
+
+    The real engine is covered by test_ocr_reads_rendered_text (CI installs tesseract-ocr).
+    """
+    pytest.importorskip("PIL")
+    pytesseract = pytest.importorskip("pytesseract")
+    from PIL import Image
+
+    monkeypatch.setattr("docsearch.extract.ocr_available", lambda: True)
+    monkeypatch.setattr(pytesseract, "image_to_string", lambda image: f"size {image.size[0]}")
+    buffer = io.BytesIO()
+    Image.new("RGB", (40, 20), "white").save(buffer, format="PNG")
+    assert extract_text("scan.PNG", buffer.getvalue()).text == "size 40"
+    assert extract_text("scan.jpg", buffer.getvalue()).media_type == "image/jpeg"
+    assert ".png" in supported_extensions()
+    with pytest.raises(ExtractionError, match="image"):
+        extract_text("broken.png", b"not an image")
