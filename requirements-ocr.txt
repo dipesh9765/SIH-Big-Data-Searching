@@ -1,0 +1,3 @@
+# Optional OCR for image uploads. Also needs the tesseract binary on PATH.
+pytesseract==0.3.13
+Pillow==13.0.0

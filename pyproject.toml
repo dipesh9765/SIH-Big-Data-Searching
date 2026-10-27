@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docsearch"
+version = "1.0.0"
+description = "A small full-text search engine: document extraction, BM25-ranked inverted index on SQLite, and a FastAPI service"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "python-multipart>=0.0.9",
+  "pypdf>=5.0",
+  "python-docx>=1.1",
+  "snowballstemmer>=2.2",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+docsearch = ["schema.sql", "static/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "benchmarks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C4", "PL", "RUF", "S", "PT", "N"]
+ignore = [
+  "PLR2004",  # thresholds are named inline
+  "S101",     # assert is how pytest works
+  "S608",     # the only dynamic SQL builds "?,?,?" placeholder lists
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/docsearch/api.py" = ["PLR0915"]  # create_app registers every route in one factory
+"tests/*" = ["S", "PLR", "PLC0415"]  # PLC0415: importorskip-style local imports
+"benchmarks/*" = ["S", "PLR", "T20"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["ocr: needs the tesseract binary and the `ocr` extra"]
+filterwarnings = [
+  "error",
+  # Starlette's TestClient prefers httpx2; the pinned httpx 0.28 still works. Revisit on upgrade.
+  "ignore:Using `httpx` with `starlette.testclient`",
+]
+
+[tool.coverage.run]
+source = ["src/docsearch"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests", "benchmarks"]
+
+[[tool.mypy.overrides]]
+module = ["snowballstemmer", "pytesseract", "PIL", "PIL.*"]
+ignore_missing_imports = true  # no type stubs published
