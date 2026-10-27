@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>docsearch</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>docsearch</h1>
+    <p id="stats" class="muted" aria-live="polite">Loading…</p>
+  </header>
+
+  <main>
+    <form id="search-form" role="search">
+      <label class="sr-only" for="q">Search documents</label>
+      <input id="q" name="q" type="search" placeholder="Search your documents…" autocomplete="off" maxlength="500" required>
+      <select id="mode" aria-label="Match mode">
+        <option value="all">All words</option>
+        <option value="any">Any word</option>
+      </select>
+      <button type="submit">Search</button>
+    </form>
+
+    <section aria-labelledby="results-h">
+      <h2 id="results-h" class="sr-only">Results</h2>
+      <p id="summary" class="muted" aria-live="polite"></p>
+      <ol id="results" class="results"></ol>
+    </section>
+
+    <section class="panel" aria-labelledby="upload-h">
+      <h2 id="upload-h">Add documents</h2>
+      <form id="upload-form">
+        <input id="file" type="file" required>
+        <button type="submit">Upload and index</button>
+      </form>
+      <p id="upload-msg" class="muted" role="status"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="docs-h">
+      <h2 id="docs-h">Indexed documents</h2>
+      <ul id="docs" class="docs"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
