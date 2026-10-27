@@ -8,7 +8,7 @@
 - FastAPI service (`/v1/documents`, `/v1/search`, `/v1/stats`, `/healthz`, `/readyz`), request ids, security headers, OpenAPI docs.
 - Single-page UI (no inline script, strict CSP).
 - The database schema, documented in `schema.sql` and `ARCHITECTURE.md` (the original was never committed).
-- 82 tests (99% coverage; the one test that needs real Tesseract runs in CI), ruff, strict mypy, reproducible benchmark, Dockerfile, CI, ADRs.
+- 82 tests (99% coverage with the OCR packages, 98% without; the test that needs real Tesseract runs in CI), ruff, strict mypy, reproducible benchmark, Dockerfile, CI, ADRs.
 
 ### Changed
 - Rebuilt from a Node/Express + Python-subprocess + MySQL prototype into a single Python service on SQLite.

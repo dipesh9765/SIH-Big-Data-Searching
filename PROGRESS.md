@@ -45,7 +45,7 @@ Rebuild as **docsearch**: a small full-text search engine with a real ranking mo
 | B Schema | `schema.sql` with documented tables, constraints and a `postings_by_doc` index; ERD in ARCHITECTURE.md |
 | C API | FastAPI: upload, list, get, delete, search, stats, health/ready; limits; request ids; security headers; no query logging |
 | D UI | One page, DOM-built results, no inline script, strict CSP |
-| E Tests | 82 tests, 99% coverage (gate 90%), ruff, strict mypy |
+| E Tests | 82 tests, 99% coverage with the OCR packages installed, 98% without (gate 90%), ruff, strict mypy |
 | F Benchmark | `benchmarks/bench.py`, seeded Zipf corpus |
 | G Build and docs | Dockerfile, Makefile, CI, README, ARCHITECTURE, 5 ADRs, SECURITY, CONTRIBUTING, CHANGELOG, LICENSE |
 
@@ -66,10 +66,9 @@ Rebuild as **docsearch**: a small full-text search engine with a real ranking mo
 | Known-item recall@1 | 100% of 200 |
 
 ## Verified
-`ruff check`, `ruff format --check`, strict `mypy` and `pytest --cov` (81 passed, 1 skipped, 99%) in the working virtualenv. The UI was exercised in the built-in browser against a real server with real DOCX, PDF, CSV and TXT files: search, highlighting, a stored `<script>` payload staying inert, upload, duplicate upload, rejected type, delete (statistics returned exactly to their previous values).
+`ruff check`, `ruff format --check`, strict `mypy` and `pytest --cov` (81 passed, 1 skipped, 99%) in the working virtualenv, and again in a **clean-room virtualenv built only from `requirements-dev.txt`** (no OCR packages): ruff, format check, strict mypy, 80 passed, 2 OCR tests skipped cleanly, 97.9% coverage. The UI was exercised in the built-in browser against a real server with real DOCX, PDF, CSV and TXT files: search, highlighting, a stored `<script>` payload staying inert, upload, duplicate upload, rejected type, delete (statistics returned exactly to their previous values).
 
 ## Not verified / open items
-- **Clean-room install** from `requirements-dev.txt` in a fresh virtualenv was started but PyPI timed out repeatedly on this machine; see the status line at the end of this file for the outcome.
 - **Real Tesseract OCR** never ran locally (the binary is not installed; the PATH entry is stale). The OCR path is covered with a stubbed engine and real Pillow; the real-engine test runs in CI where `tesseract-ocr` is installed.
 - **Docker image never built** (no Docker here); CI builds and smoke-tests it.
 - No screenshots (the browser pane's screenshot call times out here).
