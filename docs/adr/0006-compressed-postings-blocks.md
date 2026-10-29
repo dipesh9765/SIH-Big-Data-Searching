@@ -13,13 +13,27 @@ Varint over bit-packing: about 20 lines, trivially verifiable, ~2.3 bytes/postin
 ## Verified
 Differential tests against the SQLite index (same ids, same scores, same tie-breaks) on random queries, k in {1,5,10,50}, AND and OR.
 
-## Measured (in memory, 50,000 docs x ~80 tokens, 3.2M postings, 7.5 MB compressed)
-| Query | exhaustive p50 | pruned p50 |
-|---|---|---|
-| common OR rare | 86 ms | 17 ms (5.0x) |
-| 6-term mixed OR | 102 ms | 22 ms (4.7x) |
-| top-3 common OR | 157 ms | 218 ms (0.7x) |
-| common AND common | 114 ms | 159 ms (0.7x) |
+## Measured
+In memory (no database), Zipf-distributed synthetic corpus, 100,000 docs x ~80 tokens, 6.4M postings, 15.1 MB compressed (2.36 bytes/posting), top-10, median of 15 runs, one Windows laptop. "scan" scores every posting, "pruned" forces block-max, "auto" is what `search()` does by default.
 
-## Consequences
-Pruning wins when at least one query term is selective (the realistic case). With only very common terms every block's bound is close to the global bound, nothing can be skipped, and the bookkeeping makes pruned search slower than exhaustive. Planned mitigations: reorder document ids by length so block bounds tighten, an adaptive fallback to exhaustive scoring, and stop-word-like terms being dropped by idf. An exact total hit count requires disabling pruning (`exact_total=True`).
+| Query | scan | pruned | auto (chose) |
+|---|---|---|---|
+| rare AND rare | 0.09 ms | 0.04 ms | 0.04 ms (and-skip) |
+| common AND rare | 15.0 ms | 0.52 ms | 0.55 ms (and-skip), 27x faster than scan |
+| common AND common | 29 ms | 238 ms | 30 ms (scan) |
+| 3 very common words, OR | 45 ms | 331 ms | 46 ms (scan) |
+| common OR rare | 17 ms | 13 ms | 17 ms (scan) |
+| 6-term mixed OR | 20 ms | 15 ms | 20 ms (scan) |
+
+## What the first version got wrong, and the fix
+The first version always pruned. On queries made only of common words it was **slower** than scoring everything (e.g. 3 common words, 50k docs: 218 ms vs 157 ms), because no block can be skipped and the cursor bookkeeping is pure overhead. Three changes, each measured:
+
+1. **Single-byte fast path in `Block.decode`.** A block whose payload is `2*count - 1` bytes must consist of one-byte varints, so it is sliced and prefix-summed at C speed instead of decoded byte by byte. About 2x on every query that touches dense lists (the pure-Python varint loop was the dominant cost).
+2. **Vectorised scan (numpy).** The scan decodes each list once and scores all its postings in one array operation, with the same formula in the same operation order (scores equal the SQLite reference to 1e-9, tested). Common-only queries went from ~115-155 ms to 17-28 ms at 50k docs.
+3. **Cost-based strategy choice.** Prune only if the rarest term is under 5% of the corpus **and** (for OR) a scan would touch more than 300,000 postings. AND queries always drive from the rarest list when it is selective.
+
+## Consequences and limits
+- The 300,000-posting budget was set from these measurements: at 100k docs scan is within ~4 ms of pruning on mixed queries, and scan cost is linear in postings, so pruning should win clearly at larger sizes. **That crossover has not been measured at 1M documents**; this machine has 7.7 GB of RAM, and the in-memory benchmark does not fit 1M. The Postgres-backed benchmark (phase 4) is where it will be checked, and the constants may move.
+- Queries of only very common words are linear in corpus size (about 45 ms at 100k, so roughly 450 ms at 1M if it scales). Fixes that would change that: impact-ordered or score-sorted postings, or treating terms that appear in most documents as stop words at query time (not exact, so not done).
+- An exact total hit count needs a scan (`exact_total=True`); pruned searches return `total=None`.
+- numpy is now a runtime dependency of the engine (pinned in `requirements.txt`).

@@ -73,16 +73,23 @@ class Block:
 
     def decode(self) -> tuple[list[int], list[int]]:
         """Return (document ids, term frequencies), both in ascending-id order."""
-        deltas, position = decode_varints(self.payload, self.count - 1)
-        tfs, end = decode_varints(self.payload, self.count, position)
-        if end != len(self.payload):
-            raise ValueError("block payload has trailing bytes")
-        doc_ids = [self.first_doc]
-        for delta in deltas:
-            doc_ids.append(doc_ids[-1] + delta)
+        count = self.count
+        payload = self.payload
+        if len(payload) == 2 * count - 1:
+            # Every varint is at least one byte, so this length means every one is exactly one
+            # byte: slice the bytes directly (C speed). Dense lists of common terms mostly land
+            # here, and they are where most of the decoding time goes.
+            deltas: Sequence[int] = payload[: count - 1]
+            tfs: Sequence[int] = payload[count - 1 :]
+        else:
+            deltas, position = decode_varints(payload, count - 1)
+            tfs, end = decode_varints(payload, count, position)
+            if end != len(payload):
+                raise ValueError("block payload has trailing bytes")
+        doc_ids = list(itertools.accumulate(deltas, initial=self.first_doc))
         if doc_ids[-1] != self.last_doc:
             raise ValueError("block metadata does not match its payload")
-        return doc_ids, tfs
+        return doc_ids, list(tfs)
 
 
 def encode_block(doc_ids: Sequence[int], tfs: Sequence[int], lengths: Sequence[int]) -> Block:

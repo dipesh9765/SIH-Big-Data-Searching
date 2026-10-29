@@ -9,6 +9,9 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 
+import numpy as np
+import numpy.typing as npt
+
 from docsearch.analysis import term_frequencies
 from docsearch.engine.codec import Block, build_blocks
 
@@ -21,6 +24,7 @@ class MemoryIndex:
         self.doc_count = 0
         self.average_length = 0.0
         self._total_length = 0
+        self._table: npt.NDArray[np.int64] | None = None
 
     def add(self, doc_id: int, text: str) -> None:
         """Add a document. Ids must arrive in ascending order (as an auto-increment key does)."""
@@ -38,6 +42,7 @@ class MemoryIndex:
         self.doc_count += 1
         self._total_length += length
         self._blocks.clear()  # invalidate; rebuilt on demand by `finish`
+        self._table = None
 
     def finish(self) -> None:
         """Compress every postings list into blocks. Call after the last `add`."""
@@ -62,6 +67,14 @@ class MemoryIndex:
 
     def length(self, doc_id: int) -> int:
         return self._lengths[doc_id]
+
+    def length_table(self) -> npt.NDArray[np.int64]:
+        if self._table is None:
+            table = np.zeros(max(self._lengths, default=0) + 1, dtype=np.int64)
+            for doc_id, length in self._lengths.items():
+                table[doc_id] = length
+            self._table = table
+        return self._table
 
     # -- inspection -----------------------------------------------------------------------
 

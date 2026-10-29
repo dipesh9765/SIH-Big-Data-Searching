@@ -22,7 +22,7 @@ from docsearch.engine.codec import (
     iter_postings,
 )
 from docsearch.engine.memory import MemoryIndex
-from docsearch.engine.search import Mode, search
+from docsearch.engine.search import Mode, Pruning, search
 from docsearch.index import Index
 
 # ------------------------------------------------------------------------------ codec
@@ -110,11 +110,16 @@ def build(tmp_path: Path, corpus: list[str]) -> tuple[Index, MemoryIndex]:
 
 
 def assert_same_ranking(
-    reference: Index, memory: MemoryIndex, query: str, mode: Mode, k: int
+    reference: Index,
+    memory: MemoryIndex,
+    query: str,
+    mode: Mode,
+    k: int,
+    pruning: Pruning = "auto",
 ) -> None:
     terms = query_terms(query)
     expected = reference.search(query, mode=mode, limit=k)
-    got = search(memory, terms, mode=mode, k=k)
+    got = search(memory, terms, mode=mode, k=k, pruning=pruning)
     assert [h.doc_id for h in got.hits] == [h.document.id for h in expected.hits], query
     for mine, theirs in zip(got.hits, expected.hits, strict=True):
         assert mine.score == pytest.approx(theirs.score, rel=1e-9), query
@@ -127,7 +132,10 @@ _MODES: tuple[Mode, Mode] = ("any", "all")
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
 @pytest.mark.parametrize("mode", ["any", "all"])
-def test_matches_reference_on_random_queries(tmp_path: Path, seed: int, mode: Mode) -> None:
+@pytest.mark.parametrize("pruning", ["auto", "always", "never"])
+def test_matches_reference_on_random_queries(
+    tmp_path: Path, seed: int, mode: Mode, pruning: Pruning
+) -> None:
     corpus = make_corpus(seed, documents=700)  # several blocks per common term
     reference, memory = build(tmp_path, corpus)
     rng = random.Random(seed + 100)
@@ -136,7 +144,7 @@ def test_matches_reference_on_random_queries(tmp_path: Path, seed: int, mode: Mo
     for _ in range(60):
         query = " ".join(rng.choices(vocab, weights, k=rng.randint(1, 4)))
         for k in (1, 5, 10, 50):
-            assert_same_ranking(reference, memory, query, mode, k)
+            assert_same_ranking(reference, memory, query, mode, k, pruning)
     reference.close()
 
 
@@ -172,15 +180,39 @@ def test_empty_index_returns_nothing() -> None:
 
 
 def test_pruning_skips_work_but_not_results(tmp_path: Path) -> None:
-    """The point of block-max: same answer, fewer postings scored."""
-    corpus = make_corpus(11, documents=3000, vocabulary=200)
-    reference, memory = build(tmp_path, corpus)
-    terms = query_terms("w0x w1x w2x")
-    pruned = search(memory, terms, mode="any", k=10)
-    exhaustive = search(memory, terms, mode="any", k=10, exact_total=True)
-    assert [h.doc_id for h in pruned.hits] == [h.doc_id for h in exhaustive.hits]
-    assert pruned.stats.postings_scored < exhaustive.stats.postings_scored
-    assert exhaustive.stats.postings_scored == exhaustive.total
+    """The point of block-max: same answer, fewer postings scored, when a term is selective."""
+    reference, memory = build(tmp_path, make_corpus(11, documents=3000, vocabulary=200))
+    terms = query_terms("w0x w1x w150x")  # two very common words and one rare one
+    pruned = search(memory, terms, mode="any", k=10, pruning="always")
+    scanned = search(memory, terms, mode="any", k=10, pruning="never")
+    assert [h.doc_id for h in pruned.hits] == [h.doc_id for h in scanned.hits]
+    assert pruned.stats.strategy == "wand"
+    assert scanned.stats.strategy == "scan-any"
+    assert pruned.stats.postings_scored < scanned.stats.postings_scored
+    assert scanned.stats.postings_scored >= scanned.total  # type: ignore[operator]
+    reference.close()
+
+
+def test_auto_strategy_follows_selectivity_and_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference, memory = build(tmp_path, make_corpus(12, documents=2000, vocabulary=200))
+    common = search(memory, query_terms("w0x w1x"), mode="any")
+    assert common.stats.strategy == "scan-any"
+    assert common.total is not None
+    assert search(memory, query_terms("w0x w1x"), mode="all").stats.strategy == "scan-all"
+    # A selective term alone is not enough for OR: a small scan is cheaper than pruning.
+    assert search(memory, query_terms("w0x w190x"), mode="any").stats.strategy == "scan-any"
+    # With a tiny budget (i.e. a big corpus) the same query is pruned.
+    monkeypatch.setattr("docsearch.engine.search.SCAN_POSTINGS_BUDGET", 0)
+    mixed = search(memory, query_terms("w0x w190x"), mode="any")
+    assert mixed.stats.strategy == "wand"
+    assert mixed.total is None  # pruning means the match count is unknown
+    assert search(memory, query_terms("w0x w1x"), mode="any").stats.strategy == "scan-any"
+    assert search(memory, query_terms("w0x w190x"), mode="all").stats.strategy == "and-skip"
+    assert search(memory, query_terms("w190x"), mode="any", exact_total=True).stats.strategy == (
+        "scan-any"
+    )
     reference.close()
 
 

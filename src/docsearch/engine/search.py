@@ -20,10 +20,23 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+import numpy as np
+import numpy.typing as npt
+
 from docsearch.engine.codec import Block
-from docsearch.engine.scoring import bm25_idf, bm25_term_score
+from docsearch.engine.scoring import BM25_B, BM25_K1, bm25_idf, bm25_term_score
 
 Mode = Literal["all", "any"]
+Pruning = Literal["auto", "always", "never"]
+
+# Strategy choice (measured, ADR 0006). Pruning needs a selective term: its high idf lifts the
+# threshold early so common terms' blocks can be skipped; without one nothing is skippable and the
+# cursor bookkeeping makes it slower than scoring everything. And a vectorised scan is so cheap that
+# for small result sets it beats pruning outright. So: prune only if the rarest term is below
+# PRUNING_MAX_DF_FRACTION of the corpus AND a scan would touch more than SCAN_POSTINGS_BUDGET
+# postings (AND queries drive from the rarest list, so they skip the budget test).
+PRUNING_MAX_DF_FRACTION = 0.05
+SCAN_POSTINGS_BUDGET = 300_000
 _END = 1 << 62  # larger than any document id
 
 
@@ -39,6 +52,10 @@ class PostingsSource(Protocol):
 
     def length(self, doc_id: int) -> int: ...
 
+    def length_table(self) -> npt.NDArray[np.int64]:
+        """Token length of every document, indexed by document id (0 where an id is unused)."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class ScoredDoc:
@@ -53,6 +70,7 @@ class SearchStats:
     blocks_decoded: int = 0
     postings_scored: int = 0
     blocks_total: int = 0
+    strategy: str = ""  # "wand", "and-skip", "scan-any" or "scan-all"
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,62 +203,113 @@ class _TopK:
         return [ScoredDoc(-neg_id, score) for score, neg_id in ordered]
 
 
-def search(
+def search(  # noqa: PLR0913 - one public entry point; options are keyword-only
     source: PostingsSource,
     terms: Sequence[str],
     *,
     mode: Mode = "any",
     k: int = 10,
     exact_total: bool = False,
+    pruning: Pruning = "auto",
 ) -> Outcome:
     """Top-`k` documents for already-analysed `terms`.
 
-    `exact_total=True` disables pruning so the number of matching documents is exact; without it
-    `Outcome.total` is only set when the algorithm happened to visit every match.
+    `pruning="auto"` picks block-max pruning when a query term is selective and a straight scan
+    otherwise; "always" / "never" force one (tests and benchmarks). `exact_total=True` implies a
+    scan so the number of matching documents is exact; pruned searches return `total=None`.
     """
     if k < 1:
         raise ValueError("k must be at least 1")
     if not terms or source.doc_count == 0:
         return Outcome([], SearchStats(), 0)
-    distinct = list(dict.fromkeys(terms))
-    cursors: list[_Cursor] = []
-    for term in distinct:
+    known: list[tuple[str, int]] = []
+    for term in dict.fromkeys(terms):
         df = source.doc_freq(term)
         if df == 0:
             if mode == "all":
                 return Outcome([], SearchStats(), 0)
             continue
-        cursors.append(_Cursor(source, term, bm25_idf(source.doc_count, df)))
-    if not cursors:
+        known.append((term, df))
+    if not known:
         return Outcome([], SearchStats(), 0)
-    if mode == "all":
-        return _and(source, cursors, k, exact_total)
-    return _wand(source, cursors, k, exact_total)
+    rarest = min(df for _, df in known)
+    if exact_total or pruning == "never":
+        prune = False
+    elif pruning == "always":
+        prune = True
+    else:
+        selective = rarest <= PRUNING_MAX_DF_FRACTION * source.doc_count
+        prune = selective and (mode == "all" or sum(df for _, df in known) > SCAN_POSTINGS_BUDGET)
+    if not prune:
+        return _scan(source, known, mode, k)
+    cursors = [_Cursor(source, term, bm25_idf(source.doc_count, df)) for term, df in known]
+    return _and(source, cursors, k) if mode == "all" else _wand(source, cursors, k)
 
 
-def _score(source: PostingsSource, cursor: _Cursor, doc_id: int) -> float:
-    return bm25_term_score(cursor.idf, cursor.tf(), source.length(doc_id), source.average_length)
+def _scan(source: PostingsSource, known: Sequence[tuple[str, int]], mode: Mode, k: int) -> Outcome:
+    """Score every posting into a dense per-document array, then take the top k. Exact.
+
+    Per term: decode its blocks once, then score all of its postings in one vectorised step. A
+    Python loop per posting is what made scanning slow; the arithmetic is the same BM25 formula
+    in the same operation order, so scores are bit-identical to the scalar version. `Outcome.total`
+    is exact.
+    """
+    lengths = source.length_table()
+    accumulated = np.zeros(len(lengths), dtype=np.float64)
+    matched = np.zeros(len(lengths), dtype=np.int16)
+    average = source.average_length
+    decoded = 0
+    postings = 0
+    for term, df in known:
+        idf = bm25_idf(source.doc_count, df)
+        ids: list[int] = []
+        tfs: list[int] = []
+        for block in source.blocks(term):
+            block_ids, block_tfs = block.decode()
+            ids += block_ids
+            tfs += block_tfs
+            decoded += 1
+        doc_ids = np.asarray(ids, dtype=np.int64)
+        tf = np.asarray(tfs, dtype=np.float64)
+        postings += len(ids)
+        norm = BM25_K1 * (1.0 - BM25_B + BM25_B * lengths[doc_ids] / average)
+        accumulated[doc_ids] += idf * tf * (BM25_K1 + 1.0) / (tf + norm)
+        matched[doc_ids] += 1
+    needed = len(known) if mode == "all" else 1
+    candidates = np.flatnonzero(matched >= needed)
+    stats = SearchStats(decoded, postings, decoded, "scan-all" if mode == "all" else "scan-any")
+    if len(candidates) == 0:
+        return Outcome([], stats, 0)
+    scores = accumulated[candidates]
+    if len(candidates) > k:
+        # Keep everything tied with the k-th best score, so the id tie-break below is exact.
+        cutoff = np.partition(scores, len(scores) - k)[len(scores) - k]
+        keep = scores >= cutoff
+        candidates, scores = candidates[keep], scores[keep]
+    order = np.lexsort((candidates, -scores))[:k]
+    hits = [ScoredDoc(int(candidates[i]), float(scores[i])) for i in order]
+    return Outcome(hits, stats, int(np.count_nonzero(matched >= needed)))
 
 
-def _stats(cursors: Sequence[_Cursor], scored: int) -> SearchStats:
+def _stats(cursors: Sequence[_Cursor], scored: int, strategy: str) -> SearchStats:
     return SearchStats(
         blocks_decoded=sum(c.decoded for c in cursors),
         postings_scored=scored,
         blocks_total=sum(len(c._blocks) for c in cursors),
+        strategy=strategy,
     )
 
 
-def _and(source: PostingsSource, cursors: list[_Cursor], k: int, exact_total: bool) -> Outcome:
+def _and(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
     """Every term must match. Drive from the rarest list and skip the others forward to it."""
     cursors.sort(key=lambda c: len(c._blocks))
     lead, rest = cursors[0], cursors[1:]
     top = _TopK(k)
     scored = 0
-    matches = 0
     bound_total = sum(c.list_max for c in cursors)
     while lead.doc != _END:
         doc = lead.doc
-        if not exact_total and bound_total <= top.threshold:
+        if bound_total <= top.threshold:
             break  # no document anywhere can beat the current k-th score any more
         aligned = True
         for cursor in rest:
@@ -254,37 +323,32 @@ def _and(source: PostingsSource, cursors: list[_Cursor], k: int, exact_total: bo
                 break
             lead.advance_to(doc)
             continue
-        if not exact_total and sum(c.block_bound() for c in cursors) <= top.threshold:
+        if sum(c.block_bound() for c in cursors) <= top.threshold:
             lead.next()
             continue
         length = source.length(doc)
         score = sum(bm25_term_score(c.idf, c.tf(), length, source.average_length) for c in cursors)
         scored += 1
-        matches += 1
         top.offer(doc, score)
         lead.next()
-    return Outcome(top.result(), _stats(cursors, scored), matches if exact_total else None)
+    return Outcome(top.result(), _stats(cursors, scored, "and-skip"), None)
 
 
-def _wand(source: PostingsSource, cursors: list[_Cursor], k: int, exact_total: bool) -> Outcome:
+def _wand(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
     """At least one term must match: block-max WAND (Ding & Suel, 2011)."""
     top = _TopK(k)
     scored = 0
-    matches = 0
     while True:
         active = [c for c in cursors if c.doc != _END]
         if not active:
             break
         active.sort(key=lambda c: c.doc)
-        if exact_total:
-            doc = active[0].doc
-        else:
-            pivot = _pivot(active, top.threshold)
-            if pivot is None:
-                break
-            if pivot == -1:
-                continue
-            doc = pivot
+        pivot = _pivot(active, top.threshold)
+        if pivot is None:
+            break
+        if pivot == -1:
+            continue
+        doc = pivot
         total = 0.0
         length = source.length(doc)
         for cursor in active:
@@ -293,9 +357,8 @@ def _wand(source: PostingsSource, cursors: list[_Cursor], k: int, exact_total: b
             total += bm25_term_score(cursor.idf, cursor.tf(), length, source.average_length)
             cursor.next()
         scored += 1
-        matches += 1
         top.offer(doc, total)
-    return Outcome(top.result(), _stats(cursors, scored), matches if exact_total else None)
+    return Outcome(top.result(), _stats(cursors, scored, "wand"), None)
 
 
 def _pivot(active: list[_Cursor], threshold: float) -> int | None:
