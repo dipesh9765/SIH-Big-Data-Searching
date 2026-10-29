@@ -233,3 +233,17 @@ def test_snippet_without_matches_falls_back_to_the_start() -> None:
     snippet, highlights = make_snippet("   start of the document " + "z" * 500, {"nothing"})
     assert snippet.startswith("start of")
     assert highlights == []
+
+
+def test_hindi_documents_are_found_by_inflected_queries_and_highlighted(index: Index) -> None:
+    add(index, "भारत की राजधानी नई दिल्ली है। वहाँ बहुत सी किताबें मिलती हैं।", "hi")
+    add(index, "Mumbai is the financial capital of India", "en")
+    result = index.search("किताब")
+    assert [h.document.title for h in result.hits] == ["hi"]
+    hit = result.hits[0]
+    assert [hit.snippet[s:e] for s, e in hit.highlights] == ["किताबें"]
+    # A mixed-script query reaches each document through its own pipeline.
+    assert {h.document.title for h in index.search("capital राजधानी", mode="any").hits} == {
+        "hi",
+        "en",
+    }
