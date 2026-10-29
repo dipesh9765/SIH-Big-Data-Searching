@@ -8,15 +8,8 @@ from pathlib import Path
 import pytest
 
 from docsearch.analysis import term_frequencies
-from docsearch.index import (
-    BM25_B,
-    BM25_K1,
-    EmptyDocumentError,
-    Index,
-    bm25_idf,
-    bm25_term_score,
-    make_snippet,
-)
+from docsearch.engine.scoring import BM25_B, BM25_K1, bm25_idf, bm25_term_score
+from docsearch.index import EmptyDocumentError, Index, make_snippet
 
 
 @pytest.fixture

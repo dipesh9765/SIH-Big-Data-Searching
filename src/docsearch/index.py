@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import heapq
-import math
 import sqlite3
 import weakref
 from collections import Counter
@@ -23,9 +22,8 @@ from pathlib import Path
 from typing import Literal
 
 from docsearch.analysis import query_terms, term_frequencies, tokenize
+from docsearch.engine.scoring import bm25_idf, bm25_term_score
 
-BM25_K1 = 1.2  # term-frequency saturation
-BM25_B = 0.75  # document-length normalisation
 SNIPPET_CHARS = 220
 _SQL_CHUNK = 500  # stays far below SQLite's bound-variable limit
 
@@ -72,16 +70,6 @@ class Stats:
     terms: int
     postings: int
     average_length: float
-
-
-def bm25_idf(doc_count: int, doc_freq: int) -> float:
-    """Robertson-Spärck Jones idf with the +1 inside the log so it is never negative."""
-    return math.log(1.0 + (doc_count - doc_freq + 0.5) / (doc_freq + 0.5))
-
-
-def bm25_term_score(idf: float, tf: int, length: int, average_length: float) -> float:
-    norm = 1.0 - BM25_B + BM25_B * length / average_length
-    return idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm)
 
 
 def _row_to_document(row: sqlite3.Row) -> Document:
