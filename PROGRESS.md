@@ -83,3 +83,19 @@ The MySQL `root` password in `app.js` appeared in 10 commits. The database no lo
 - [x] Audit
 - [x] A-G
 - [ ] Pushed (blocked, see above)
+
+
+## Scale-out rebuild (branch `feature/scale-v2`, started 2026-10-29)
+
+Goal: millions of documents, many media types, inverted index in a database. Plan: Postgres (metadata, own compressed postings, pgvector), MinIO for files, FastAPI + workers, React UI. Phases and decisions are in the plan file; ADRs 0006 and 0007 record what is built.
+
+Done and tested (no Docker needed):
+- `engine/codec.py`, `engine/search.py`, `engine/memory.py`: compressed postings blocks, block-max WAND, vectorised scan, cost-based strategy choice. Differential tests against the SQLite index (ADR 0006).
+- `analysis.py`: Hindi/Marathi tokenisation fix (Python's `\w` split Devanagari words at every vowel sign), script-routed stemming, stop words.
+- `query.py`: total parser for phrases, AND/OR/NOT, `-term`, grouping, filters; bounded for hostile input.
+- `engine/terms.py`: prefix completion and typo-tolerant lookup (ADR 0007).
+
+Blocked / not started:
+- **Docker Desktop is not installed on this machine** (no WSL either). Everything Postgres/MinIO/compose is untested and not written.
+- **RAM: 7.7 GB total (about 1 GB free during work).** A 1M-document Postgres benchmark alongside MinIO and workers will be tight; plan for a smaller corpus first (200-300k) and say so, or run on a bigger machine.
+- Positions (phrase matching), storage layer, ingestion workers, media (OCR/Whisper/embeddings), React UI, hardening and docs.
