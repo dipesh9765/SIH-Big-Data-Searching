@@ -55,7 +55,7 @@ Idea: read only block metadata (bounds, counts) per query and fetch a block's pa
 | common OR rare | 86.2 ms | 96.6 ms |
 | 6-term mixed OR | 64.5 ms | 134.3 ms |
 
-It was slower where it was meant to help. Block-max WAND and skip-driven intersection jump around a long list, so each jump into an unfetched region costs a round trip (about 0.5 ms), while reading a whole list is one query returning a few hundred KB. At this size the transfer is cheaper than the round trips. It was reverted; the code is in git history only as a never-committed experiment.
+It was slower where it was meant to help. Block-max WAND and skip-driven intersection jump around a long list, so each jump into an unfetched region costs a round trip (about 0.5 ms), while reading a whole list is one query returning a few hundred KB. At this size the transfer is cheaper than the round trips. It was reverted before being committed, so the code is not in the history.
 
 What this does and does not show: lazy fetching loses at 300k documents, where the longest list is about 2,300 blocks. It might win for lists of tens of thousands of blocks (millions of documents per term), but that is untested here (7.7 GB RAM), so it stays out. If it is revisited, avoid per-skip round trips: prefetch ranges guided by the metadata, or keep hot terms' blocks in a process-local cache keyed by the `generation` counter.
 
