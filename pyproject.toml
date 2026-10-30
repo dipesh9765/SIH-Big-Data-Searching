@@ -17,6 +17,7 @@ dependencies = [
   "python-docx>=1.1",
   "snowballstemmer>=2.2",
   "numpy>=2.0",
+  "psycopg[binary]>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,7 @@ ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-docsearch = ["schema.sql", "static/*"]
+docsearch = ["schema.sql", "static/*", "engine/pg_schema.sql"]
 
 [tool.ruff]
 line-length = 100

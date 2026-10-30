@@ -8,3 +8,4 @@ pypdf==6.21.2
 python-docx==1.2.0
 snowballstemmer==3.1.1
 numpy==2.5.4
+psycopg[binary]==3.3.6

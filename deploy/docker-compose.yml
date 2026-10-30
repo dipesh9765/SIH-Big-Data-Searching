@@ -1,0 +1,35 @@
+# Local infrastructure for docsearch. `docker compose -f deploy/docker-compose.yml up -d postgres`
+# Ports are bound to loopback only; the default password is for local development.
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: docsearch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docsearch_dev}
+      POSTGRES_DB: docsearch
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - synchronous_commit=off   # indexing throughput; a crash loses at most the last commits
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docsearch -d docsearch"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  pgdata:

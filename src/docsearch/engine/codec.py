@@ -17,8 +17,11 @@ because it is ~20 lines, easy to verify, and fast enough in pure Python (see ADR
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
 
 BLOCK_SIZE = 128
 
@@ -116,7 +119,8 @@ def encode_block(doc_ids: Sequence[int], tfs: Sequence[int], lengths: Sequence[i
 
 
 def build_blocks(
-    postings: Iterable[tuple[int, int]], length_of: dict[int, int] | None = None
+    postings: Iterable[tuple[int, int]],
+    length_of: Mapping[int, int] | npt.NDArray[np.int64] | None = None,
 ) -> list[Block]:
     """Split sorted (doc_id, tf) postings into blocks. `length_of` maps doc id -> token length."""
     blocks: list[Block] = []
@@ -133,8 +137,10 @@ def build_blocks(
     return blocks
 
 
-def _flush(ids: list[int], tfs: list[int], length_of: dict[int, int] | None) -> Block:
-    lengths = [1] * len(ids) if length_of is None else [length_of[d] for d in ids]
+def _flush(
+    ids: list[int], tfs: list[int], length_of: Mapping[int, int] | npt.NDArray[np.int64] | None
+) -> Block:
+    lengths = [1] * len(ids) if length_of is None else [int(length_of[d]) for d in ids]
     return encode_block(ids, tfs, lengths)
 
 
