@@ -89,3 +89,6 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
 CREATE INDEX IF NOT EXISTS ingest_jobs_claim ON ingest_jobs (kind, run_after)
     WHERE state IN ('queued', 'running');
 CREATE INDEX IF NOT EXISTS ingest_jobs_asset ON ingest_jobs (asset_id);
+
+-- Added with OCR: mean word confidence (0-100) when the text came from OCR, so poor scans can be found.
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS ocr_confidence real;

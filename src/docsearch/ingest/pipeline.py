@@ -17,20 +17,25 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from docsearch.engine.pg import NewDocument, PgIndex
 from docsearch.extract import (
+    IMAGE_MEDIA_TYPES,
     Extracted,
     ExtractionError,
+    NeedsOcrError,
     UnsupportedMediaTypeError,
     clean_filename,
+    clean_text,
     extract_text,
-    supported_extensions,
+    service_extensions,
 )
 from docsearch.ingest.objects import ObjectNotFoundError, ObjectStore, object_key
 from docsearch.ingest.queue import Job, JobQueue
+from docsearch.ocr import OcrConfig, ocr_image, ocr_pdf
 
 log = logging.getLogger("docsearch.ingest")
 
@@ -50,6 +55,7 @@ class BatchResult:
     indexed: int = 0
     retried: int = 0
     failed: int = 0
+    rerouted: int = 0  # text jobs handed to the OCR pool (scanned PDFs)
     lost: int = 0  # leases that expired while we worked: another worker owns the job now
 
 
@@ -68,11 +74,13 @@ def submit(  # noqa: PLR0913 - one entry point; everything after `store` is keyw
     that asset had failed, it is queued again: re-uploading is the way to ask for a retry.
     """
     clean = clean_filename(name)
-    if Path(clean).suffix.lower() not in supported_extensions():
+    suffix = Path(clean).suffix.lower()
+    if suffix not in service_extensions():
         raise UnsupportedMediaTypeError(
-            f"unsupported file type {Path(clean).suffix or '(none)'!r}; "
-            f"accepted: {', '.join(supported_extensions())}"
+            f"unsupported file type {suffix or '(none)'!r}; "
+            f"accepted: {', '.join(service_extensions())}"
         )
+    kind = "ocr" if suffix in IMAGE_MEDIA_TYPES else "text"  # images always need recognition
     shown = ((title or "").strip() or clean)[:MAX_TITLE_CHARS]
     digest = hashlib.sha256(data).digest()
     key = object_key(digest.hex())
@@ -84,7 +92,9 @@ def submit(  # noqa: PLR0913 - one entry point; everything after `store` is keyw
             (key, digest, clean, shown, len(data)),
         ).fetchone()
         if created is not None:
-            return Submission(created[0], _enqueue(conn, created[0], max_attempts), "queued", False)
+            return Submission(
+                created[0], _enqueue(conn, created[0], max_attempts, kind), "queued", False
+            )
         existing = conn.execute(
             "SELECT id, status FROM assets WHERE sha256 = %s FOR UPDATE", (digest,)
         ).fetchone()
@@ -96,15 +106,16 @@ def submit(  # noqa: PLR0913 - one entry point; everything after `store` is keyw
                 " WHERE id = %s",
                 (asset_id,),
             )
-            return Submission(asset_id, _enqueue(conn, asset_id, max_attempts), "queued", True)
+            return Submission(
+                asset_id, _enqueue(conn, asset_id, max_attempts, kind), "queued", True
+            )
         return Submission(asset_id, None, status, True)
 
 
-def _enqueue(conn: object, asset_id: int, max_attempts: int) -> int:
+def _enqueue(conn: object, asset_id: int, max_attempts: int, kind: str) -> int:
     row = conn.execute(  # type: ignore[attr-defined]
-        "INSERT INTO ingest_jobs (asset_id, kind, max_attempts)"
-        " VALUES (%s, 'text', %s) RETURNING id",
-        (asset_id, max_attempts),
+        "INSERT INTO ingest_jobs (asset_id, kind, max_attempts) VALUES (%s, %s, %s) RETURNING id",
+        (asset_id, kind, max_attempts),
     ).fetchone()
     return int(row[0])
 
@@ -115,10 +126,40 @@ class _Failure:
     retry: bool
 
 
-def _extract(store: ObjectStore, source_name: str, key: str, job: Job) -> Extracted | _Failure:
-    """Fetch and extract one file, sorting failures into permanent and transient."""
+@dataclass(frozen=True, slots=True)
+class _Reroute:
+    kind: str
+
+
+def _extract(  # noqa: PLR0911, PLR0913, PLR0917 - one return per outcome; plain arguments
+    store: ObjectStore,
+    source_name: str,
+    key: str,
+    job: Job,
+    ocr: OcrConfig,
+    heartbeat: Callable[[int, int], None],
+) -> Extracted | _Failure | _Reroute:
+    """Fetch and extract one file, sorting failures into permanent and transient.
+
+    `text` jobs parse the file directly and hand scanned PDFs on to the OCR pool; `ocr` jobs
+    recognise images and the scanned pages of PDFs.
+    """
     try:
-        return extract_text(source_name, store.get(key))
+        data = store.get(key)
+        if job.kind != "ocr":
+            return extract_text(source_name, data, detect_scanned=True)
+        suffix = Path(source_name).suffix.lower()
+        if suffix in IMAGE_MEDIA_TYPES:
+            result = ocr_image(data, ocr)
+            media_type = IMAGE_MEDIA_TYPES[suffix]
+        elif suffix == ".pdf":
+            result = ocr_pdf(data, ocr, on_page=heartbeat)
+            media_type = "application/pdf"
+        else:
+            return _Failure("OCR handles images and PDFs only", retry=False)
+        return Extracted(clean_text(result.text), media_type, result.confidence)
+    except NeedsOcrError:
+        return _Reroute("ocr")
     except ObjectNotFoundError:
         return _Failure("the stored file is missing", retry=False)
     except ExtractionError as exc:
@@ -128,8 +169,15 @@ def _extract(store: ObjectStore, source_name: str, key: str, job: Job) -> Extrac
         return _Failure(f"{type(exc).__name__}: {exc}", retry=True)
 
 
-def process_batch(
-    index: PgIndex, queue: JobQueue, store: ObjectStore, jobs: list[Job], worker_id: str
+def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
+    index: PgIndex,
+    queue: JobQueue,
+    store: ObjectStore,
+    jobs: list[Job],
+    worker_id: str,
+    *,
+    ocr: OcrConfig | None = None,
+    lease_seconds: float = 300.0,
 ) -> BatchResult:
     """Extract and index the files behind `jobs`, then settle each job individually.
 
@@ -146,7 +194,8 @@ def process_batch(
                 ([job.asset_id for job in jobs],),
             )
         }
-    indexed = retried = failed = lost = 0
+    ocr = ocr or OcrConfig()
+    indexed = retried = failed = lost = rerouted = 0
 
     def settle_failure(job: Job, error: str, *, retry: bool) -> None:
         nonlocal retried, failed, lost
@@ -159,19 +208,32 @@ def process_batch(
             lost += 1
 
     ready: list[tuple[Job, str, Extracted]] = []
+
+    def result_of() -> BatchResult:
+        return BatchResult(indexed, retried, failed, rerouted, lost)
+
     for job in jobs:
         meta = assets.get(job.asset_id)
         if meta is None:
             settle_failure(job, "asset record is missing", retry=False)
             continue
         source_name, title, key = meta
-        outcome = _extract(store, source_name, key, job)
+
+        def heartbeat(_done: int, _total: int, job: Job = job) -> None:
+            queue.extend(job.id, worker_id, lease_seconds)
+
+        outcome = _extract(store, source_name, key, job, ocr, heartbeat)
         if isinstance(outcome, _Failure):
             settle_failure(job, outcome.message, retry=outcome.retry)
+        elif isinstance(outcome, _Reroute):
+            if queue.reroute(job.id, worker_id, outcome.kind):
+                rerouted += 1
+            else:
+                lost += 1
         else:
             ready.append((job, title, outcome))
     if not ready:
-        return BatchResult(indexed, retried, failed, lost)
+        return result_of()
 
     documents = [
         NewDocument(title, assets[job.asset_id][0], extracted.media_type, extracted.text)
@@ -183,19 +245,19 @@ def process_batch(
         log.warning("indexing a batch of %d failed: %s", len(ready), exc)
         for job, _, _ in ready:
             settle_failure(job, f"{type(exc).__name__}: {exc}", retry=True)
-        return BatchResult(indexed, retried, failed, lost)
-    for (job, _, _), result in zip(ready, added, strict=True):
+        return result_of()
+    for (job, _, extracted), result in zip(ready, added, strict=True):
         if result is None:
             settle_failure(job, "the file contains no indexable text", retry=False)
             continue
         with index.connection() as conn:
             conn.execute(
                 "UPDATE assets SET status = 'indexed', document_id = %s, error = NULL,"
-                " updated_at = now() WHERE id = %s",
-                (result.document_id, job.asset_id),
+                " ocr_confidence = %s, updated_at = now() WHERE id = %s",
+                (result.document_id, extracted.confidence, job.asset_id),
             )
         if queue.complete(job.id, worker_id):
             indexed += 1
         else:
             lost += 1
-    return BatchResult(indexed, retried, failed, lost)
+    return result_of()

@@ -48,6 +48,8 @@ class ServiceSettings:
     s3_secure: bool = False
     max_upload_bytes: int = 10 * 1024 * 1024
     max_results: int = 50
+    ocr_languages: str = "eng+hin+mar"
+    ocr_max_pages: int = 200
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ServiceSettings:
@@ -67,4 +69,16 @@ class ServiceSettings:
             s3_secure=secure in ("1", "true", "yes"),
             max_upload_bytes=base.max_upload_bytes,
             max_results=base.max_results,
+            ocr_languages=env.get("DOCSEARCH_OCR_LANGS", defaults.ocr_languages),
+            ocr_max_pages=_positive_int(env, "DOCSEARCH_OCR_MAX_PAGES", defaults.ocr_max_pages),
         )
+
+
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    try:
+        value = int(env.get(name, default))
+    except ValueError as exc:
+        raise ValueError(f"invalid {name}: {exc}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value

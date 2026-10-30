@@ -67,6 +67,13 @@ curl http://127.0.0.1:8080/v1/assets/1                          # queued / proce
 curl 'http://127.0.0.1:8080/v1/search?q=glacier'
 ```
 
+Images and scanned PDFs are read by a separate OCR worker (Tesseract: English, Hindi, Marathi), which runs in Docker:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile ocr up -d --build worker-ocr
+curl -F file=@scan.pdf http://127.0.0.1:8080/v1/documents       # a text worker hands it to the OCR pool
+```
+
 Measured on 300,000 synthetic documents and what is not yet built: see [PROGRESS.md](PROGRESS.md) and ADRs 0006-0010.
 
 ## API

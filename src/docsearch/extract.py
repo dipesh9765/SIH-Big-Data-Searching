@@ -19,6 +19,19 @@ from pathlib import PurePosixPath, PureWindowsPath
 MAX_TEXT_CHARS = 5_000_000  # cap on extracted text so one huge file cannot exhaust memory
 MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # zip-bomb guard for .docx
 MAX_PDF_PAGES = 2_000
+MIN_TEXT_LAYER_CHARS = 25  # OCR keeps a page's own text layer only if it has at least this many
+ROUTING_MIN_CHARS = 5  # non-space characters for a page to count as having text when routing
+SCANNED_PAGE_FRACTION = 0.8  # fewer than this share of pages with text: send the PDF to OCR
+IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # keeps \t \n \r: fine inside text
 _FILENAME_CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # names also lose them (log/header injection)
 
@@ -31,10 +44,15 @@ class UnsupportedMediaTypeError(ExtractionError):
     """The file extension is not one we can extract text from."""
 
 
+class NeedsOcrError(ExtractionError):
+    """The PDF is (mostly) scanned pages with no text layer; an OCR worker must handle it."""
+
+
 @dataclass(frozen=True, slots=True)
 class Extracted:
     text: str
     media_type: str
+    confidence: float | None = None  # mean OCR word confidence (0-100), when OCR was used
 
 
 def clean_filename(name: str) -> str:
@@ -94,7 +112,7 @@ def _docx(data: bytes) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _pdf(data: bytes) -> str:
+def _pdf_pages(data: bytes) -> list[str]:
     from pypdf import PdfReader  # noqa: PLC0415
     from pypdf.errors import PyPdfError  # noqa: PLC0415
 
@@ -104,9 +122,13 @@ def _pdf(data: bytes) -> str:
             raise ExtractionError("PDF is encrypted")
         if len(reader.pages) > MAX_PDF_PAGES:
             raise ExtractionError(f"PDF has more than {MAX_PDF_PAGES} pages")
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        return [page.extract_text() or "" for page in reader.pages]
     except PyPdfError as exc:
         raise ExtractionError(f"unreadable PDF: {exc}") from exc
+
+
+def _pdf(data: bytes) -> str:
+    return "\n".join(_pdf_pages(data))
 
 
 def ocr_available() -> bool:
@@ -154,8 +176,27 @@ def supported_extensions() -> list[str]:
     return sorted(ext for ext, (mt, _) in _PARSERS.items() if ocr or not mt.startswith("image/"))
 
 
-def extract_text(filename: str, data: bytes) -> Extracted:
-    """Extract text from `data`, choosing the parser from the extension of `filename`."""
+def clean_text(raw: str) -> str:
+    """Strip control characters and enforce the size cap on extracted text."""
+    text = _CONTROL.sub(" ", raw)
+    if len(text) > MAX_TEXT_CHARS:
+        raise ExtractionError(f"extracted text exceeds {MAX_TEXT_CHARS:,} characters")
+    return text
+
+
+def service_extensions() -> list[str]:
+    """Extensions the scale-out service accepts: images are always accepted there, because the
+    API process only queues them and a separate OCR worker reads them."""
+    plain = [ext for ext, (mt, _) in _PARSERS.items() if not mt.startswith("image/")]
+    return sorted({*plain, *IMAGE_MEDIA_TYPES})
+
+
+def extract_text(filename: str, data: bytes, *, detect_scanned: bool = False) -> Extracted:
+    """Extract text from `data`, choosing the parser from the extension of `filename`.
+
+    With `detect_scanned`, a PDF whose pages mostly have no text layer raises `NeedsOcrError`
+    instead of returning (nearly) empty text, so the caller can route it to an OCR worker.
+    """
     suffix = PurePosixPath(clean_filename(filename).lower()).suffix
     entry = _PARSERS.get(suffix)
     if entry is None:
@@ -164,7 +205,12 @@ def extract_text(filename: str, data: bytes) -> Extracted:
             f"accepted: {', '.join(supported_extensions())}"
         )
     media_type, parser = entry
-    text = _CONTROL.sub(" ", parser(data))
-    if len(text) > MAX_TEXT_CHARS:
-        raise ExtractionError(f"extracted text exceeds {MAX_TEXT_CHARS:,} characters")
-    return Extracted(text=text, media_type=media_type)
+    if detect_scanned and suffix == ".pdf":
+        pages = _pdf_pages(data)
+        with_text = sum(len("".join(page.split())) >= ROUTING_MIN_CHARS for page in pages)
+        if pages and with_text < SCANNED_PAGE_FRACTION * len(pages):
+            raise NeedsOcrError("the PDF has no text layer; it needs OCR")
+        raw = "\n".join(pages)
+    else:
+        raw = parser(data)
+    return Extracted(text=clean_text(raw), media_type=media_type)

@@ -1,3 +1,5 @@
-# Optional OCR for image uploads. Also needs the tesseract binary on PATH.
+# Optional OCR for image uploads and scanned PDFs. Also needs the tesseract binary on PATH.
 pytesseract==0.3.13
 Pillow==13.0.0
+pypdfium2==5.14.0
+pypdfium2==5.14.0

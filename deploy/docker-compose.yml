@@ -42,6 +42,29 @@ services:
       - objectdata:/data
       - ./s3.json:/etc/seaweedfs/s3.json:ro
 
+  # OCR worker (Tesseract: English, Hindi, Marathi). Optional: `--profile ocr up -d worker-ocr`.
+  worker-ocr:
+    profiles: ["ocr"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      target: worker
+    depends_on:
+      - postgres
+      - objects
+    environment:
+      DOCSEARCH_DSN: postgresql://docsearch:${POSTGRES_PASSWORD:-docsearch_dev}@postgres:5432/docsearch
+      DOCSEARCH_SCHEMA: ${DOCSEARCH_SCHEMA:-public}
+      DOCSEARCH_S3_ENDPOINT: objects:8333
+      DOCSEARCH_S3_BUCKET: ${DOCSEARCH_S3_BUCKET:-docsearch}
+      DOCSEARCH_OCR_LANGS: ${DOCSEARCH_OCR_LANGS:-eng+hin+mar}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "2"
+
 volumes:
   pgdata:
   objectdata:

@@ -14,7 +14,7 @@ import pytest
 from docsearch.engine.pg import PgIndex
 from docsearch.extract import UnsupportedMediaTypeError
 from docsearch.ingest.objects import MemoryStore, ObjectNotFoundError, S3Store, object_key
-from docsearch.ingest.pipeline import process_batch, submit
+from docsearch.ingest.pipeline import BatchResult, process_batch, submit
 from docsearch.ingest.queue import BACKOFF_CAP_SECONDS, JobQueue, backoff_seconds
 from docsearch.ingest.worker import Worker
 from tests.conftest import make_docx, make_pdf
@@ -453,7 +453,10 @@ def test_many_workers_in_parallel_index_everything_exactly_once(
     workers = [Worker(index, store, worker_id=f"w{i}", batch_size=5) for i in range(4)]
 
     def drain(worker: Worker) -> None:
-        while worker.queue.counts()["queued"] or worker.queue.counts()["running"]:
+        for _ in range(200):  # bounded: never hang the suite
+            counts = worker.queue.counts()
+            if not counts["queued"] and not counts["running"]:
+                return
             worker.run_once()
 
     threads = [threading.Thread(target=drain, args=(w,)) for w in workers]
@@ -520,3 +523,142 @@ def test_compactor_survives_a_failing_compaction(
     stop.set()
     thread.join(timeout=5)
     assert len(calls) >= 3  # kept trying after the first failure
+
+
+# ------------------------------------------------------------------------------------- OCR
+
+
+def ocr_worker(index: PgIndex, store: MemoryStore, **kwargs: object) -> Worker:
+    return Worker(index, store, worker_id="ocr-1", kinds=("ocr",), batch_size=1, **kwargs)  # type: ignore[arg-type]
+
+
+def job_kinds(index: PgIndex) -> list[str]:
+    with index.connection() as conn:
+        return [r[0] for r in conn.execute("SELECT kind FROM ingest_jobs ORDER BY id")]
+
+
+def test_images_are_queued_for_the_ocr_pool_and_text_workers_never_take_them(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    from tests.ocr_helpers import png, render_text
+
+    submit(index, store, name="photo.png", data=png(render_text(["hello"])))
+    submit(index, store, name="notes.txt", data=b"plain text notes here")
+    assert job_kinds(index) == ["ocr", "text"]
+    result = Worker(index, store, worker_id="t1").run_once()
+    assert result.indexed == 1  # only the text file
+    assert JobQueue(index).counts()["queued"] == 1  # the image is still waiting for OCR
+
+
+def test_a_scanned_pdf_is_rerouted_from_the_text_pool_to_the_ocr_pool(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    from tests.ocr_helpers import image_only_pdf, render_text
+
+    sub = submit(index, store, name="scan.pdf", data=image_only_pdf(render_text(["scanned"])))
+    assert job_kinds(index) == ["text"]
+    first = Worker(index, store, worker_id="t1").run_once()
+    assert (first.rerouted, first.indexed, first.failed) == (1, 0, 0)
+    assert job_kinds(index) == ["ocr"]
+    assert asset(index, sub.asset_id)[0] == "queued"
+    with index.connection() as conn:
+        (attempts,) = conn.execute("SELECT attempts FROM ingest_jobs").fetchone()  # type: ignore[misc]
+    assert attempts == 0  # rerouting is not a failed attempt
+    assert Worker(index, store, worker_id="t1").run_once() == type(first)()  # text pool: nothing
+
+
+def test_reroute_is_fenced_like_every_other_state_change(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    submit(index, store, name="a.txt", data=text_file(1))
+    queue = JobQueue(index)
+    (job,) = queue.claim("w1")
+    assert not queue.reroute(job.id, "intruder", "ocr")
+    assert queue.reroute(job.id, "w1", "ocr")
+    assert not queue.reroute(job.id, "w1", "ocr")  # no longer running
+
+
+def test_long_ocr_jobs_renew_their_lease_page_by_page(
+    index: PgIndex, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docsearch.ocr import OcrResult
+    from tests.ocr_helpers import image_only_pdf, render_text
+
+    submit(index, store, name="big.pdf", data=image_only_pdf(render_text(["x"])))
+    Worker(index, store, worker_id="t1").run_once()  # reroute to ocr
+    extensions = []
+    queue = JobQueue(index)
+    original = queue.extend
+
+    def spy(job_id: int, worker_id: str, lease: float) -> bool:
+        extensions.append(lease)
+        return original(job_id, worker_id, lease)
+
+    def fake_pdf(_data: bytes, _config: object = None, on_page: object = None) -> OcrResult:
+        for page in range(1, 4):
+            on_page(page, 3)  # type: ignore[operator]
+        return OcrResult("recognised words from three pages", 88.0, 3, 3)
+
+    monkeypatch.setattr("docsearch.ingest.pipeline.ocr_pdf", fake_pdf)
+    worker = ocr_worker(index, store, lease_seconds=120.0)
+    monkeypatch.setattr(worker.queue, "extend", spy)
+    result = worker.run_once()
+    assert result.indexed == 1
+    assert extensions == [120.0, 120.0, 120.0]
+    with index.connection() as conn:
+        (confidence,) = conn.execute("SELECT ocr_confidence FROM assets").fetchone()  # type: ignore[misc]
+    assert confidence == pytest.approx(88.0)
+
+
+def test_ocr_pool_rejects_types_it_cannot_read(index: PgIndex, store: MemoryStore) -> None:
+    sub = submit(index, store, name="notes.txt", data=text_file(5))
+    JobQueue(index).claim("x")  # take it away from the text pool, then misroute it
+    with index.connection() as conn:
+        conn.execute("UPDATE ingest_jobs SET state = 'queued', kind = 'ocr', locked_by = NULL")
+    result = ocr_worker(index, store).run_once()
+    assert result.failed == 1
+    assert asset(index, sub.asset_id)[2] == "OCR handles images and PDFs only"
+
+
+def test_a_corrupt_image_fails_permanently_with_a_readable_reason(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    sub = submit(index, store, name="broken.png", data=b"\x89PNG not really")
+    result = ocr_worker(index, store).run_once()
+    assert result.failed == 1
+    assert asset(index, sub.asset_id)[2] == "not a readable image"
+
+
+def test_ocr_end_to_end_makes_scanned_content_searchable(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    from docsearch.ocr import tesseract_available
+    from tests.ocr_helpers import image_only_pdf, png, render_text
+
+    if not tesseract_available():
+        pytest.skip("tesseract not installed")
+    photo = submit(
+        index, store, name="sign.png", data=png(render_text(["Glacier monitoring station"]))
+    )
+    scan = submit(
+        index,
+        store,
+        name="report.pdf",
+        data=image_only_pdf(render_text(["Volcano eruption report"])),
+    )
+    Worker(index, store, worker_id="t1").run_once()  # the PDF moves to the OCR pool
+    worker = ocr_worker(index, store)
+    for _ in range(20):
+        if worker.run_once() == BatchResult():
+            break
+    else:
+        raise AssertionError("the OCR queue did not drain")
+    for sub in (photo, scan):
+        status, document_id, error = asset(index, sub.asset_id)
+        assert (status, error) == ("indexed", None)
+        assert document_id is not None
+    assert [h.document.source_name for h in index.search("glacier").hits] == ["sign.png"]
+    assert [h.document.source_name for h in index.search("volcano").hits] == ["report.pdf"]
+    with index.connection() as conn:
+        rows = conn.execute("SELECT ocr_confidence FROM assets ORDER BY id").fetchall()
+    assert all(r[0] is not None and 40 <= r[0] <= 100 for r in rows)

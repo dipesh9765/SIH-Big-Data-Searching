@@ -47,8 +47,12 @@ class Rig:
         )
 
     def drain(self) -> None:
-        while self.worker.run_once().indexed or self.worker.queue.counts()["queued"]:
-            pass
+        for _ in range(100):  # bounded: a job nobody can take must fail the test, not hang it
+            self.worker.run_once()
+            counts = self.worker.queue.counts()
+            if not counts["queued"] and not counts["running"]:
+                return
+        raise AssertionError(f"queue did not drain: {self.worker.queue.counts()}")
 
 
 @pytest.fixture

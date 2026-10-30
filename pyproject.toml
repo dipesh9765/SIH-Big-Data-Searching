@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
+ocr = ["pytesseract>=0.3.10", "Pillow>=10.0", "pypdfium2>=4.30"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -74,5 +74,5 @@ strict = true
 files = ["src", "tests", "benchmarks"]
 
 [[tool.mypy.overrides]]
-module = ["snowballstemmer", "pytesseract", "PIL", "PIL.*"]
+module = ["snowballstemmer", "pytesseract", "PIL", "PIL.*", "pypdfium2"]
 ignore_missing_imports = true  # no type stubs published

@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+# Ingestion worker with OCR: Tesseract (English, Hindi, Marathi) + pypdfium2.
+#   docker build -f deploy/Dockerfile.worker -t docsearch-worker .
+#   docker build -f deploy/Dockerfile.worker --target test -t docsearch-worker-test .   (with dev tools)
+FROM python:3.13-slim AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin tesseract-ocr-mar \
+ && rm -rf /var/lib/apt/lists/*
+ENV PYTHONUNBUFFERED=1 OMP_THREAD_LIMIT=1
+# OMP_THREAD_LIMIT=1: Tesseract's own threading oversubscribes cores when several workers run;
+# scale by running more workers instead.
+WORKDIR /app
+COPY requirements.txt requirements-ocr.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt
+
+FROM base AS worker
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps . \
+ && useradd --system --uid 10001 --create-home app
+USER app
+ENTRYPOINT ["python", "-m", "docsearch.ingest.worker"]
+CMD ["--kinds", "ocr", "--compact-interval", "0"]
+
+# Test image: fonts to render sample pages, dev tools. Source is mounted at run time (-v .:/app).
+FROM base AS test
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-dejavu-core fonts-lohit-deva \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+ENV PYTHONPATH=/app/src:/app
+CMD ["pytest", "-q", "--no-cov"]

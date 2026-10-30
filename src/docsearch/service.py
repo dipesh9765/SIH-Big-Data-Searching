@@ -30,7 +30,7 @@ from docsearch import __version__
 from docsearch.api import DocumentOut
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import PgHit, PgIndex
-from docsearch.extract import UnsupportedMediaTypeError, supported_extensions
+from docsearch.extract import UnsupportedMediaTypeError, service_extensions
 from docsearch.ingest.objects import ObjectStore
 from docsearch.ingest.pipeline import Submission, submit
 from docsearch.ingest.queue import JobQueue
@@ -63,6 +63,7 @@ class AssetOut(BaseModel):
     document_id: int | None
     error: str | None
     created_at: str
+    ocr_confidence: float | None
 
 
 class HitOut(BaseModel):
@@ -102,7 +103,9 @@ class StatsOut(BaseModel):
     version: str
 
 
-_ASSET_COLUMNS = "id, title, source_name, size, status, document_id, error, created_at"
+_ASSET_COLUMNS = (
+    "id, title, source_name, size, status, document_id, error, created_at, ocr_confidence"
+)
 
 
 def _asset(row: tuple[object, ...]) -> AssetOut:
@@ -115,6 +118,7 @@ def _asset(row: tuple[object, ...]) -> AssetOut:
         document_id=row[5],  # type: ignore[arg-type]
         error=row[6],  # type: ignore[arg-type]
         created_at=row[7].isoformat(timespec="seconds"),  # type: ignore[attr-defined]
+        ocr_confidence=None if row[8] is None else round(row[8], 1),  # type: ignore[call-overload]
     )
 
 
@@ -250,7 +254,7 @@ def create_service_app(
             delta_postings=s.delta_postings,
             average_length=s.average_length,
             queue=queue.counts(),
-            accepted_extensions=supported_extensions(),
+            accepted_extensions=service_extensions(),
             max_upload_bytes=settings.max_upload_bytes,
             version=__version__,
         )

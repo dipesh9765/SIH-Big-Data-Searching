@@ -23,6 +23,7 @@ from docsearch.engine.pg import PgIndex
 from docsearch.ingest.objects import ObjectStore, S3Store
 from docsearch.ingest.pipeline import BatchResult, process_batch
 from docsearch.ingest.queue import JobQueue
+from docsearch.ocr import OcrConfig, check_ready
 
 log = logging.getLogger("docsearch.worker")
 
@@ -41,6 +42,7 @@ class Worker:
         kinds: Sequence[str] = ("text",),
         batch_size: int = 16,
         lease_seconds: float = 300.0,
+        ocr: OcrConfig | None = None,
     ) -> None:
         self.index = index
         self.store = store
@@ -49,13 +51,22 @@ class Worker:
         self.kinds = tuple(kinds)
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
+        self.ocr = ocr or OcrConfig()
 
     def run_once(self) -> BatchResult:
         """Claim and process one batch; an empty result means there was nothing to do."""
         jobs = self.queue.claim(
             self.worker_id, self.kinds, limit=self.batch_size, lease_seconds=self.lease_seconds
         )
-        return process_batch(self.index, self.queue, self.store, jobs, self.worker_id)
+        return process_batch(
+            self.index,
+            self.queue,
+            self.store,
+            jobs,
+            self.worker_id,
+            ocr=self.ocr,
+            lease_seconds=self.lease_seconds,
+        )
 
     def run(self, stop: threading.Event, *, poll_interval: float = 1.0) -> None:
         """Process until `stop` is set, sleeping `poll_interval` when the queue is empty."""
@@ -73,10 +84,11 @@ class Worker:
                 stop.wait(poll_interval)
             else:
                 log.info(
-                    "batch: %d indexed, %d retried, %d failed, %d lost",
+                    "batch: %d indexed, %d retried, %d failed, %d rerouted, %d lost",
                     result.indexed,
                     result.retried,
                     result.failed,
+                    result.rerouted,
                     result.lost,
                 )
         log.info("worker %s stopped", self.worker_id)
@@ -110,7 +122,12 @@ def build_store(settings: ServiceSettings) -> S3Store:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="docsearch ingestion worker")
-    parser.add_argument("--batch", type=int, default=16, help="jobs claimed per round")
+    parser.add_argument(
+        "--batch", type=int, default=None, help="jobs claimed per round (default 16; 1 for ocr)"
+    )
+    parser.add_argument(
+        "--lease", type=float, default=None, help="job lease seconds (default 300; 900 for ocr)"
+    )
     parser.add_argument("--kinds", default="text", help="comma-separated job kinds to handle")
     parser.add_argument("--poll", type=float, default=1.0, help="seconds to wait on an empty queue")
     parser.add_argument(
@@ -124,9 +141,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     settings = ServiceSettings.from_env()
+    kinds = args.kinds.split(",")
+    ocr = OcrConfig(languages=settings.ocr_languages, max_pages=settings.ocr_max_pages)
+    if "ocr" in kinds:
+        try:
+            check_ready(ocr)  # refuse to run, rather than fail every job, if OCR is not usable
+        except RuntimeError as exc:
+            log.error("cannot start an OCR worker: %s", exc)
+            raise SystemExit(2) from exc
+    heavy = "ocr" in kinds
     with PgIndex(settings.dsn, schema=settings.schema) as index:
         worker = Worker(
-            index, build_store(settings), kinds=args.kinds.split(","), batch_size=args.batch
+            index,
+            build_store(settings),
+            kinds=kinds,
+            batch_size=args.batch or (1 if heavy else 16),
+            lease_seconds=args.lease or (900.0 if heavy else 300.0),
+            ocr=ocr,
         )
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):

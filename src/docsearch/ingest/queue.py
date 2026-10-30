@@ -149,6 +149,23 @@ class JobQueue:
             )
             return "dead"
 
+    def reroute(self, job_id: int, worker_id: str, kind: str) -> bool:
+        """Hand a running job to another worker pool (text -> ocr). Not a failure: the attempt
+        counter starts over for the new pool. False if this worker no longer owns the job."""
+        with self._index.connection() as conn:
+            row = conn.execute(
+                "UPDATE ingest_jobs SET kind = %s, state = 'queued', attempts = 0,"
+                " locked_by = NULL, locked_until = NULL, run_after = now(), updated_at = now()"
+                " WHERE id = %s AND locked_by = %s AND state = 'running' RETURNING asset_id",
+                (kind, job_id, worker_id),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "UPDATE assets SET status = 'queued', updated_at = now() WHERE id = %s", (row[0],)
+            )
+            return True
+
     def extend(self, job_id: int, worker_id: str, lease_seconds: float) -> bool:
         """Push the lease out for a long-running job. False if the lease was already lost."""
         with self._index.connection() as conn:
