@@ -96,6 +96,10 @@ Done and tested (no Docker needed):
 - `engine/terms.py`: prefix completion and typo-tolerant lookup (ADR 0007).
 
 Blocked / not started:
-- **Docker Desktop is not installed on this machine** (no WSL either). Everything Postgres/MinIO/compose is untested and not written.
+- (Resolved) Docker Desktop is now installed; Postgres 17 + pgvector runs from `deploy/docker-compose.yml`.
 - **RAM: 7.7 GB total (about 1 GB free during work).** A 1M-document Postgres benchmark alongside MinIO and workers will be tight; plan for a smaller corpus first (200-300k) and say so, or run on a bigger machine.
 - Positions (phrase matching), storage layer, ingestion workers, media (OCR/Whisper/embeddings), React UI, hardening and docs.
+
+Postgres layer (done, tested; ADR 0008): `engine/pg.py` + `pg_schema.sql` (delta table, compactor, snapshot reads, pool); 16 tests compare it with the SQLite reference in every storage state. 300k-document benchmark recorded in the ADR (ingest 1.4k docs/s; compaction must run continuously; faster than Postgres FTS on common-term queries, slower on rare-term queries).
+
+Still open: lazy per-block fetching, deletion, MinIO + ingestion workers and job queue, phrase positions, API wiring (the FastAPI app still uses the SQLite index), OCR / speech / embeddings, React UI, CI for the compose services, a 1M-document run on a bigger machine.

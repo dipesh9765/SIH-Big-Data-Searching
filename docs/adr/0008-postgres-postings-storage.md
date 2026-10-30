@@ -22,3 +22,23 @@ The index must hold millions of documents in a database with proper architecture
 - Connection per call; a pool is needed for a server.
 - The length array is O(documents) memory per process (8 bytes each): 8 MB per million documents, fine.
 - Serialised ingest caps write throughput to one transaction at a time; bulk batches amortise it.
+
+## Measured (300,000 synthetic documents, 19.5M postings, 350,000 terms)
+Zipf corpus, ~80 tokens per document plus one unique token each, `benchmarks/pg_bench.py`. One Windows laptop (12 cores, 7.7 GB RAM), PostgreSQL 17 in Docker Desktop with 512 MB `shared_buffers` and a 2 GB container limit, synchronous_commit off. Queries are top-10 through a connection pool; median of 9 runs. The baseline is PostgreSQL full-text search (`to_tsvector('simple')` + GIN, `ts_rank_cd`) on the same documents.
+
+| | docsearch | Postgres FTS |
+|---|---|---|
+| ingest (500-doc batches, includes text analysis in Python) | 1,400 docs/s, flat from 10k to 300k | n/a |
+| index size (excluding document text) | 114 MB blocks + 59 MB terms | 386 MB (tsvector + GIN) |
+| rare AND rare | 4.4 ms | 0.7 ms |
+| common AND rare | 25.6 ms | 2.3 ms |
+| common AND common | 162 ms | 508 ms |
+| 3 common words, OR | 231 ms | 2,229 ms |
+| common OR rare | 92 ms | 2,003 ms |
+| 6-term mixed OR | 67 ms | 3,367 ms |
+
+How to read it: the full-text search wins the selective queries (a GIN lookup is a few page reads; our path pays for a pooled connection, six queries and decoding every block of each term). It loses by 3-30x where the query terms are common, because it must rank every match, while ours scans or prunes with block bounds. The two engines rank differently (`ts_rank_cd` has no idf or length normalisation), so overlap of their top-10 lists is not reported as a quality measure. These are synthetic words, not real language; a real corpus has a different frequency shape and relevance judgements this benchmark does not have.
+
+**Compaction finding.** Compacting a 19.5M-posting delta in one go ran at 28k postings/s (701 s, after a keyset-paging fix; 897 s before it); compacting every 50,000 documents ran at 125k postings/s (156 s in total), with the same query latency afterwards and a slightly larger block table (114 MB vs 98 MB, from partial tail blocks). A 100,000-document run, whose delta fits in cache, compacted at 130k/s. The likely cause is that the delta no longer fits in memory (this is a hypothesis supported by the three runs, not profiled I/O). The compactor should therefore run continuously and keep the delta small; it is not a nightly job.
+
+Not measured: 1M documents (this machine's 7.7 GB RAM makes it a poor test; the trend above is linear in postings for scans), concurrent ingest while querying, p99 under load, relevance quality.

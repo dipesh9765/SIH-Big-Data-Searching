@@ -63,6 +63,9 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=500)
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--compact-every", type=int, default=0, help="compact after every N documents (0: once)"
+    )
     parser.add_argument("--fts", action="store_true", help="also build and query Postgres FTS")
     parser.add_argument("--keep", action="store_true", help="keep the schema afterwards")
     args = parser.parse_args()
@@ -77,18 +80,30 @@ def main() -> None:
     gc.freeze()
 
     t0 = time.perf_counter()
+    compact_time = 0.0
+    compacted_postings = 0
     for offset in range(0, len(docs), args.batch):
         index.add_many(docs[offset : offset + args.batch])
+        if args.compact_every and (offset + args.batch) % args.compact_every == 0:
+            began = time.perf_counter()
+            compacted_postings += index.compact().postings
+            compact_time += time.perf_counter() - began
         if (offset // args.batch) % 20 == 19:
             done = offset + args.batch
             print(
                 f"  ingested {done:,} ({done / (time.perf_counter() - t0):,.0f} docs/s)", flush=True
             )
-    ingest = time.perf_counter() - t0
+    ingest = time.perf_counter() - t0 - compact_time
     print(f"ingest: {args.docs / ingest:,.0f} docs/s ({ingest:.0f}s, batch {args.batch})")
 
     t0 = time.perf_counter()
     moved = index.compact()
+    compact_time += time.perf_counter() - t0
+    compacted_postings += moved.postings
+    print(
+        f"compaction total: {compacted_postings:,} postings in {compact_time:.0f}s "
+        f"({compacted_postings / compact_time:,.0f}/s)"
+    )
     print(
         f"compaction: {moved.postings:,} postings, {moved.terms:,} terms "
         f"in {time.perf_counter() - t0:.0f}s"

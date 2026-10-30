@@ -309,26 +309,38 @@ class PgIndex:
         with psycopg.connect(self._dsn, autocommit=True) as guard:
             if not guard.execute("SELECT pg_try_advisory_lock(%s)", (_COMPACT_LOCK,)).fetchone()[0]:  # type: ignore[index]
                 return CompactionStats(skipped=True)
-            terms = postings = 0
+            terms = postings = after = 0
             while True:
                 with self._connect() as conn:
-                    moved_terms, moved_postings = self._compact_chunk(conn, term_batch)
+                    moved_terms, moved_postings, after = self._compact_chunk(
+                        conn, term_batch, after
+                    )
                 if moved_terms == 0:
                     break
                 terms += moved_terms
                 postings += moved_postings
             return CompactionStats(terms, postings)
 
-    def _compact_chunk(self, conn: psycopg.Connection, term_batch: int) -> tuple[int, int]:
+    def _compact_chunk(
+        self, conn: psycopg.Connection, term_batch: int, after: int
+    ) -> tuple[int, int, int]:
+        """Move the next `term_batch` terms with id > `after`; returns (terms, postings, last id).
+
+        Keyset paging, not "the first N terms": deleted delta rows linger as dead index entries
+        until vacuum, and a scan that restarts from the beginning each time walks over all of them
+        (measured: compaction slowed from 80k to 22k postings/s as the delta grew). Terms that
+        gain postings behind the cursor while this runs are picked up by the next `compact()`.
+        """
         term_ids = [
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT term_id FROM postings_delta ORDER BY term_id LIMIT %s",
-                (term_batch,),
+                "SELECT DISTINCT term_id FROM postings_delta WHERE term_id > %s"
+                " ORDER BY term_id LIMIT %s",
+                (after, term_batch),
             )
         ]
         if not term_ids:
-            return 0, 0
+            return 0, 0, after
         rows = conn.execute(
             "DELETE FROM postings_delta WHERE term_id = ANY(%s) RETURNING term_id, doc_id, tf",
             (term_ids,),
@@ -394,7 +406,7 @@ class PgIndex:
             (list(delta), [len(p) for p in delta.values()]),
         )
         conn.execute("UPDATE meta SET value = value + 1 WHERE key = 'generation'")
-        return len(delta), len(rows)
+        return len(delta), len(rows), term_ids[-1]
 
     # ------------------------------------------------------------------------------ search
 
