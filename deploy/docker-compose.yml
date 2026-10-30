@@ -1,4 +1,4 @@
-# Local infrastructure for docsearch. `docker compose -f deploy/docker-compose.yml up -d postgres`
+# Local infrastructure for docsearch: `docker compose -f deploy/docker-compose.yml up -d postgres objects`
 # Ports are bound to loopback only; the default password is for local development.
 services:
   postgres:
@@ -31,5 +31,17 @@ services:
         limits:
           memory: 2g
 
+  # S3-compatible object store for the original files. MinIO's public images were withdrawn, so
+  # this uses SeaweedFS (Apache-2.0); the code only speaks the S3 API, so any S3 server works.
+  objects:
+    image: chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860
+    command: server -dir=/data -volume.max=0 -master.volumeSizeLimitMB=256 -s3 -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "127.0.0.1:${S3_PORT:-8333}:8333"
+    volumes:
+      - objectdata:/data
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
+
 volumes:
   pgdata:
+  objectdata:

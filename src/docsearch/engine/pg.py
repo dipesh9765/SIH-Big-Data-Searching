@@ -217,16 +217,37 @@ class PgIndex:
         return self.add_many([doc])[0]
 
     def add_many(self, docs: Sequence[NewDocument]) -> list[Added]:
-        """Index a batch in one transaction. Identical text (SHA-256) is stored once."""
-        prepared = []
+        """Index a batch in one transaction. Identical text (SHA-256) is stored once.
+
+        Raises `EmptyDocumentError` (and indexes nothing) if any document has no indexable text.
+        """
+        results = self._add(docs, skip_empty=False)
+        return [added for added in results if added is not None]
+
+    def add_many_skipping_empty(self, docs: Sequence[NewDocument]) -> list[Added | None]:
+        """Like `add_many`, but a document with no indexable text yields None instead of failing
+        the whole batch. The result lines up with `docs`."""
+        return self._add(docs, skip_empty=True)
+
+    def connection(self) -> AbstractContextManager[psycopg.Connection]:
+        """A pooled connection (commits on a clean exit, rolls back on an exception)."""
+        return self._connect()
+
+    def _add(self, docs: Sequence[NewDocument], *, skip_empty: bool) -> list[Added | None]:
+        prepared: list[tuple[NewDocument, dict[str, int], int, bytes]] = []
+        slots: list[int | None] = []  # per input document: its position in `prepared`, or None
         for doc in docs:
-            counts, length = term_frequencies(doc.text)
+            frequencies, length = term_frequencies(doc.text)
             if length == 0:
-                raise EmptyDocumentError(f"document {doc.title!r} contains no indexable text")
+                if not skip_empty:
+                    raise EmptyDocumentError(f"document {doc.title!r} contains no indexable text")
+                slots.append(None)
+                continue
             digest = hashlib.sha256(doc.text.encode("utf-8")).digest()
-            prepared.append((doc, counts, length, digest))
+            slots.append(len(prepared))
+            prepared.append((doc, frequencies, length, digest))
         if not prepared:
-            return []
+            return [None] * len(slots)
         with self._connect() as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (_WRITE_LOCK, self._schema)
@@ -275,11 +296,11 @@ class PgIndex:
                     ([digest for _, _, _, digest in prepared],),
                 )
             }
-        results = []
+        added: list[Added] = []
         for position, (_, _, _, digest) in enumerate(prepared):
             is_first_new = digest in ids and first_seen[digest] == position
-            results.append(Added(existing[digest], duplicate=not is_first_new))
-        return results
+            added.append(Added(existing[digest], duplicate=not is_first_new))
+        return [None if slot is None else added[slot] for slot in slots]
 
     @staticmethod
     def _write_postings(

@@ -52,3 +52,40 @@ CREATE TABLE IF NOT EXISTS meta (
 
 INSERT INTO meta (key, value) VALUES ('doc_count', 0), ('total_length', 0), ('generation', 0)
 ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------------------------
+-- Ingestion: original files live in the object store; these tables track them and their work.
+
+CREATE TABLE IF NOT EXISTS assets (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    object_key  text        NOT NULL UNIQUE,       -- content-addressed: derived from sha256 only
+    sha256      bytea       NOT NULL UNIQUE,       -- of the uploaded bytes: identical files are stored once
+    source_name text        NOT NULL,
+    title       text        NOT NULL,
+    size        bigint      NOT NULL,
+    status      text        NOT NULL DEFAULT 'queued'
+                CHECK (status IN ('queued', 'processing', 'indexed', 'failed')),
+    document_id bigint,                            -- set when indexed (may be shared: identical text)
+    error       text,                              -- user-visible reason when failed
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    asset_id     bigint      NOT NULL,
+    kind         text        NOT NULL DEFAULT 'text',   -- which worker pool handles it
+    state        text        NOT NULL DEFAULT 'queued'
+                 CHECK (state IN ('queued', 'running', 'done', 'dead')),
+    attempts     integer     NOT NULL DEFAULT 0,
+    max_attempts integer     NOT NULL DEFAULT 5,
+    run_after    timestamptz NOT NULL DEFAULT now(),    -- backoff: not before this time
+    locked_by    text,
+    locked_until timestamptz,                           -- lease; a crashed worker's job becomes claimable
+    last_error   text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ingest_jobs_claim ON ingest_jobs (kind, run_after)
+    WHERE state IN ('queued', 'running');
+CREATE INDEX IF NOT EXISTS ingest_jobs_asset ON ingest_jobs (asset_id);

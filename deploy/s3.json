@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "docsearch",
+      "credentials": [{ "accessKey": "docsearch", "secretKey": "docsearch_dev_secret" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

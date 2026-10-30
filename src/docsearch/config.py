@@ -32,3 +32,39 @@ class Settings:
             max_upload_bytes=int(max_upload_mb * 2**20),
             max_results=max_results,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceSettings:
+    """Settings for the scale-out service (PostgreSQL + object store). Defaults match the local
+    docker compose stack and are for development only: set real values in any shared environment."""
+
+    dsn: str = "postgresql://docsearch:docsearch_dev@127.0.0.1:5433/docsearch"
+    schema: str = "public"
+    s3_endpoint: str = "127.0.0.1:8333"
+    s3_access_key: str = "docsearch"
+    s3_secret_key: str = "docsearch_dev_secret"  # noqa: S105 - local-development default
+    s3_bucket: str = "docsearch"
+    s3_secure: bool = False
+    max_upload_bytes: int = 10 * 1024 * 1024
+    max_results: int = 50
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> ServiceSettings:
+        env = os.environ if env is None else env
+        base = Settings.from_env(env)
+        defaults = cls()
+        secure = env.get("DOCSEARCH_S3_SECURE", "").strip().lower()
+        if secure not in ("", "0", "1", "true", "false", "yes", "no"):
+            raise ValueError(f"invalid DOCSEARCH_S3_SECURE: {secure!r}")
+        return cls(
+            dsn=env.get("DOCSEARCH_DSN", defaults.dsn),
+            schema=env.get("DOCSEARCH_SCHEMA", defaults.schema),
+            s3_endpoint=env.get("DOCSEARCH_S3_ENDPOINT", defaults.s3_endpoint),
+            s3_access_key=env.get("DOCSEARCH_S3_ACCESS_KEY", defaults.s3_access_key),
+            s3_secret_key=env.get("DOCSEARCH_S3_SECRET_KEY", defaults.s3_secret_key),
+            s3_bucket=env.get("DOCSEARCH_S3_BUCKET", defaults.s3_bucket),
+            s3_secure=secure in ("1", "true", "yes"),
+            max_upload_bytes=base.max_upload_bytes,
+            max_results=base.max_results,
+        )
