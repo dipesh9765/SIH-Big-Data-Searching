@@ -44,6 +44,7 @@ def pg() -> Iterator[PgIndex]:
     try:
         yield index
     finally:
+        index.close()
         index.drop_schema()
 
 

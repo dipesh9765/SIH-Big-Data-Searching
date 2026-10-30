@@ -21,7 +21,8 @@ from __future__ import annotations
 import hashlib
 import re
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from importlib import resources
 
@@ -29,6 +30,7 @@ import numpy as np
 import numpy.typing as npt
 import psycopg
 from psycopg import IsolationLevel
+from psycopg_pool import ConnectionPool
 
 from docsearch.analysis import query_terms, term_frequencies
 from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, iter_postings
@@ -159,7 +161,7 @@ def _merge(
 
 
 class PgIndex:
-    def __init__(self, dsn: str, *, schema: str = "public") -> None:
+    def __init__(self, dsn: str, *, schema: str = "public", pool_size: int = 8) -> None:
         if not _SCHEMA_NAME.fullmatch(schema):
             raise ValueError(f"invalid schema name: {schema!r}")
         self._dsn = dsn
@@ -167,15 +169,45 @@ class PgIndex:
         self._lengths = _LengthCache()
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
-        with self._connect() as conn:
+        # Opening a connection costs more than a small query (~10 ms here), so connections are
+        # pooled. Every borrower gets a clean, default-isolation connection (see `_read`).
+        self._pool = ConnectionPool(
+            dsn,
+            min_size=1,
+            max_size=pool_size,
+            kwargs={"options": f"-c search_path={schema}"},
+            open=True,
+        )
+        with self._pool.connection() as conn:
             conn.execute(
                 resources.files("docsearch.engine").joinpath("pg_schema.sql").read_text("utf-8")
             )
 
-    def _connect(self, *, autocommit: bool = False) -> psycopg.Connection:
-        return psycopg.connect(
-            self._dsn, options=f"-c search_path={self._schema}", autocommit=autocommit
-        )
+    def close(self) -> None:
+        """Close the connection pool. Safe to call more than once."""
+        self._pool.close()
+
+    def __enter__(self) -> PgIndex:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _connect(self) -> AbstractContextManager[psycopg.Connection]:
+        return self._pool.connection()
+
+    @contextmanager
+    def _read(self) -> Iterator[psycopg.Connection]:
+        """A pooled connection in one read-only REPEATABLE READ snapshot, reset afterwards."""
+        with self._pool.connection() as conn:
+            conn.isolation_level = IsolationLevel.REPEATABLE_READ
+            conn.read_only = True
+            try:
+                yield conn
+            finally:
+                conn.rollback()  # end the snapshot before the connection goes back to the pool
+                conn.isolation_level = None
+                conn.read_only = None
 
     # ------------------------------------------------------------------------------ ingest
 
@@ -274,7 +306,7 @@ class PgIndex:
         One transaction per chunk of terms, so a crash loses nothing and readers (who use a
         snapshot) never see a half-moved term. Only one compactor runs at a time.
         """
-        with self._connect(autocommit=True) as guard:
+        with psycopg.connect(self._dsn, autocommit=True) as guard:
             if not guard.execute("SELECT pg_try_advisory_lock(%s)", (_COMPACT_LOCK,)).fetchone()[0]:  # type: ignore[index]
                 return CompactionStats(skipped=True)
             terms = postings = 0
@@ -378,9 +410,7 @@ class PgIndex:
         terms = query_terms(query)
         if not terms:
             return PgSearchResult(0, [], "")
-        with self._connect() as conn:
-            conn.isolation_level = IsolationLevel.REPEATABLE_READ
-            conn.read_only = True
+        with self._read() as conn:
             snapshot = self._snapshot(conn, terms)
             if snapshot.doc_count == 0:
                 return PgSearchResult(0, [], "")
