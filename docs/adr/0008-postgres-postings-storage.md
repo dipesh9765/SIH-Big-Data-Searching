@@ -42,3 +42,22 @@ How to read it: the full-text search wins the selective queries (a GIN lookup is
 **Compaction finding.** Compacting a 19.5M-posting delta in one go ran at 28k postings/s (701 s, after a keyset-paging fix; 897 s before it); compacting every 50,000 documents ran at 125k postings/s (156 s in total), with the same query latency afterwards and a slightly larger block table (114 MB vs 98 MB, from partial tail blocks). A 100,000-document run, whose delta fits in cache, compacted at 130k/s. The likely cause is that the delta no longer fits in memory (this is a hypothesis supported by the three runs, not profiled I/O). The compactor should therefore run continuously and keep the delta small; it is not a nightly job.
 
 Not measured: 1M documents (this machine's 7.7 GB RAM makes it a poor test; the trend above is linear in postings for scans), concurrent ingest while querying, p99 under load, relevance quality.
+
+## Tried and rejected: lazy per-block payload fetching
+Idea: read only block metadata (bounds, counts) per query and fetch a block's payload when it is first decoded, in chunks of 32 blocks, so blocks that pruning skips are never read. It was implemented, passed the differential tests, and was measured against the eager version on the same 300,000-document corpus (median of 15 runs, same machine, one after the other):
+
+| Query | eager (all blocks, one query) | lazy |
+|---|---|---|
+| rare AND rare | 4.6 ms | 6.0 ms |
+| common AND rare | 27.6 ms | 44.9 ms |
+| common AND common | 181.8 ms | 173.0 ms |
+| 3 common words, OR | 238.7 ms | 246.6 ms |
+| common OR rare | 86.2 ms | 96.6 ms |
+| 6-term mixed OR | 64.5 ms | 134.3 ms |
+
+It was slower where it was meant to help. Block-max WAND and skip-driven intersection jump around a long list, so each jump into an unfetched region costs a round trip (about 0.5 ms), while reading a whole list is one query returning a few hundred KB. At this size the transfer is cheaper than the round trips. It was reverted; the code is in git history only as a never-committed experiment.
+
+What this does and does not show: lazy fetching loses at 300k documents, where the longest list is about 2,300 blocks. It might win for lists of tens of thousands of blocks (millions of documents per term), but that is untested here (7.7 GB RAM), so it stays out. If it is revisited, avoid per-skip round trips: prefetch ranges guided by the metadata, or keep hot terms' blocks in a process-local cache keyed by the `generation` counter.
+
+## Found while doing this
+Advisory locks were database-wide, so a compactor running on one schema made `compact()` on another schema return "skipped" (a flaky test, caught while a benchmark was running in a different schema). The locks are now `(class, hashtext(schema))` pairs, with a regression test.

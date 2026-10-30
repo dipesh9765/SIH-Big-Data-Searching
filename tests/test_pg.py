@@ -192,3 +192,19 @@ def test_query_terms_helper_agrees_with_what_was_indexed(pg: PgIndex) -> None:
     pg.add(doc(0, "running dogs"))
     assert query_terms("runs dog") == ["run", "dog"]
     assert pg.search("runs dog").hits[0].document.title == "0"
+
+
+def test_a_running_compactor_blocks_only_its_own_schema(pg: PgIndex) -> None:
+    other = PgIndex(DSN, schema=f"t_{uuid.uuid4().hex[:12]}")
+    try:
+        for index in (pg, other):
+            index.add(doc(0, "alpha beta gamma"))
+        with psycopg.connect(DSN, autocommit=True) as holder:
+            holder.execute("SELECT pg_advisory_lock(2, hashtext(%s))", (pg._schema,))
+            assert pg.compact().skipped
+            assert not other.compact().skipped
+            holder.execute("SELECT pg_advisory_unlock(2, hashtext(%s))", (pg._schema,))
+        assert not pg.compact().skipped
+    finally:
+        other.close()
+        other.drop_schema()

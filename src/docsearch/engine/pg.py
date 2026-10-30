@@ -37,8 +37,10 @@ from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, iter_posting
 from docsearch.engine.search import Mode, Outcome, Pruning, search
 from docsearch.index import Document, EmptyDocumentError, make_snippet
 
-_WRITE_LOCK = 0x646F6373_01  # advisory lock: one ingest transaction at a time
-_COMPACT_LOCK = 0x646F6373_02  # advisory lock: one compactor at a time
+# Advisory locks are (class, hash of the schema name) so indexes in different schemas of one
+# database never block each other.
+_WRITE_LOCK = 1  # one ingest transaction at a time
+_COMPACT_LOCK = 2  # one compactor at a time
 _SCHEMA_NAME = re.compile(r"[a-z_][a-z0-9_]{0,40}")
 
 
@@ -226,7 +228,9 @@ class PgIndex:
         if not prepared:
             return []
         with self._connect() as conn:
-            conn.execute("SELECT pg_advisory_xact_lock(%s)", (_WRITE_LOCK,))
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (_WRITE_LOCK, self._schema)
+            )
             first_seen: dict[bytes, int] = {}
             values: list[object] = []
             fresh = []
@@ -307,7 +311,10 @@ class PgIndex:
         snapshot) never see a half-moved term. Only one compactor runs at a time.
         """
         with psycopg.connect(self._dsn, autocommit=True) as guard:
-            if not guard.execute("SELECT pg_try_advisory_lock(%s)", (_COMPACT_LOCK,)).fetchone()[0]:  # type: ignore[index]
+            locked = guard.execute(
+                "SELECT pg_try_advisory_lock(%s, hashtext(%s))", (_COMPACT_LOCK, self._schema)
+            ).fetchone()
+            if locked is None or not locked[0]:
                 return CompactionStats(skipped=True)
             terms = postings = after = 0
             while True:
