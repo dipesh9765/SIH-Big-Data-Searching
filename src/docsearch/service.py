@@ -1,0 +1,263 @@
+"""The scale-out HTTP service: PostgreSQL index, object store, asynchronous ingestion.
+
+    POST   /v1/documents       store an upload and queue it; 202 with an asset id to poll
+    GET    /v1/assets/{id}     where that upload is: queued / processing / indexed / failed
+    GET    /v1/assets          recent uploads (optionally by status)
+    GET    /v1/documents       indexed documents, newest first
+    GET    /v1/documents/{id}  one document's metadata
+    GET    /v1/search          BM25-ranked search with snippets
+    GET    /v1/stats           index and queue statistics
+    GET    /healthz, /readyz   liveness / readiness (database and object store)
+
+Unlike the single-node `api.py`, an upload returns before indexing happens: extraction can take
+seconds for a large PDF, and holding a request open for it would tie up a server thread per
+upload. The caller polls the asset (or just searches later). Workers (`docsearch.ingest.worker`)
+do the indexing; this process never extracts text.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal
+
+from fastapi import FastAPI, File, Query, Response, UploadFile
+from pydantic import BaseModel
+
+from docsearch import __version__
+from docsearch.api import DocumentOut
+from docsearch.config import ServiceSettings
+from docsearch.engine.pg import PgHit, PgIndex
+from docsearch.extract import UnsupportedMediaTypeError, supported_extensions
+from docsearch.ingest.objects import ObjectStore
+from docsearch.ingest.pipeline import Submission, submit
+from docsearch.ingest.queue import JobQueue
+from docsearch.ingest.worker import build_store
+from docsearch.web import error, install_guard
+
+log = logging.getLogger("docsearch.service")
+MAX_LIST = 200
+
+
+class SubmissionOut(BaseModel):
+    asset_id: int
+    job_id: int | None
+    status: str
+    duplicate: bool
+
+    @classmethod
+    def of(cls, sub: Submission) -> SubmissionOut:
+        return cls(
+            asset_id=sub.asset_id, job_id=sub.job_id, status=sub.status, duplicate=sub.duplicate
+        )
+
+
+class AssetOut(BaseModel):
+    asset_id: int
+    title: str
+    source_name: str
+    size: int
+    status: str
+    document_id: int | None
+    error: str | None
+    created_at: str
+
+
+class HitOut(BaseModel):
+    document: DocumentOut
+    score: float
+    snippet: str
+    highlights: list[tuple[int, int]]
+
+    @classmethod
+    def of(cls, hit: PgHit) -> HitOut:
+        return cls(
+            document=DocumentOut.of(hit.document),
+            score=round(hit.score, 6),
+            snippet=hit.snippet,
+            highlights=hit.highlights,
+        )
+
+
+class SearchOut(BaseModel):
+    query: str
+    mode: Literal["all", "any"]
+    total: int | None  # None: pruning skipped matches, so the exact count is not known
+    strategy: str
+    took_ms: float
+    results: list[HitOut]
+
+
+class StatsOut(BaseModel):
+    documents: int
+    terms: int
+    block_postings: int
+    delta_postings: int
+    average_length: float
+    queue: dict[str, int]
+    accepted_extensions: list[str]
+    max_upload_bytes: int
+    version: str
+
+
+_ASSET_COLUMNS = "id, title, source_name, size, status, document_id, error, created_at"
+
+
+def _asset(row: tuple[object, ...]) -> AssetOut:
+    return AssetOut(
+        asset_id=row[0],  # type: ignore[arg-type]
+        title=row[1],  # type: ignore[arg-type]
+        source_name=row[2],  # type: ignore[arg-type]
+        size=row[3],  # type: ignore[arg-type]
+        status=row[4],  # type: ignore[arg-type]
+        document_id=row[5],  # type: ignore[arg-type]
+        error=row[6],  # type: ignore[arg-type]
+        created_at=row[7].isoformat(timespec="seconds"),  # type: ignore[attr-defined]
+    )
+
+
+def create_service_app(
+    settings: ServiceSettings | None = None,
+    *,
+    index: PgIndex | None = None,
+    store: ObjectStore | None = None,
+) -> FastAPI:
+    """Build the app. `index` and `store` may be injected (tests); else they come from settings."""
+    settings = settings or ServiceSettings.from_env()
+    owns_index = index is None
+    index = index or PgIndex(settings.dsn, schema=settings.schema)
+    store = store or build_store(settings)
+    queue = JobQueue(index)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        if owns_index:
+            index.close()
+
+    app = FastAPI(
+        title="docsearch service",
+        version=__version__,
+        docs_url="/docs",
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+    install_guard(app, settings.max_upload_bytes)
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    def readyz() -> dict[str, object]:
+        try:
+            documents = index.stats().documents
+            store.ping()
+        except Exception as exc:
+            log.error("readiness check failed: %s", exc)
+            raise error(503, "a dependency is unavailable") from exc
+        return {"status": "ready", "documents": documents}
+
+    @app.post("/v1/documents", response_model=SubmissionOut, status_code=202)
+    def upload(
+        response: Response,
+        file: Annotated[UploadFile, File(description="A .txt, .md, .csv, .docx or .pdf file")],
+        title: Annotated[str | None, Query(max_length=200)] = None,
+    ) -> SubmissionOut:
+        data = file.file.read(settings.max_upload_bytes + 1)
+        if len(data) > settings.max_upload_bytes:
+            raise error(413, f"file exceeds {settings.max_upload_bytes // 2**20} MB")
+        if not data:
+            raise error(422, "the file is empty")
+        try:
+            submission = submit(index, store, name=file.filename or "", data=data, title=title)
+        except UnsupportedMediaTypeError as exc:
+            raise error(415, str(exc)) from exc
+        except Exception as exc:  # store or database unavailable: the client should retry
+            log.error("upload failed: %s", exc)
+            raise error(503, "could not accept the upload right now") from exc
+        if submission.job_id is None:
+            response.status_code = 200  # nothing new was queued: these bytes were uploaded before
+        return SubmissionOut.of(submission)
+
+    @app.get("/v1/assets/{asset_id}", response_model=AssetOut)
+    def get_asset(asset_id: int) -> AssetOut:
+        with index.connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ASSET_COLUMNS} FROM assets WHERE id = %s", (asset_id,)
+            ).fetchone()
+        if row is None:
+            raise error(404, "asset not found")
+        return _asset(row)
+
+    @app.get("/v1/assets", response_model=list[AssetOut])
+    def list_assets(
+        status: Literal["queued", "processing", "indexed", "failed"] | None = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_LIST)] = 50,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    ) -> list[AssetOut]:
+        with index.connection() as conn:
+            rows = conn.execute(
+                f"SELECT {_ASSET_COLUMNS} FROM assets WHERE (%s::text IS NULL OR status = %s)"
+                " ORDER BY id DESC LIMIT %s OFFSET %s",
+                (status, status, limit, offset),
+            ).fetchall()
+        return [_asset(row) for row in rows]
+
+    @app.get("/v1/documents", response_model=list[DocumentOut])
+    def list_documents(
+        limit: Annotated[int, Query(ge=1, le=MAX_LIST)] = 50,
+        offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
+    ) -> list[DocumentOut]:
+        return [DocumentOut.of(d) for d in index.list_documents(limit=limit, offset=offset)]
+
+    @app.get("/v1/documents/{doc_id}", response_model=DocumentOut)
+    def get_document(doc_id: int) -> DocumentOut:
+        document = index.get_document(doc_id)
+        if document is None:
+            raise error(404, "document not found")
+        return DocumentOut.of(document)
+
+    @app.get("/v1/search", response_model=SearchOut)
+    def search(
+        q: Annotated[str, Query(min_length=1, max_length=500)],
+        mode: Literal["all", "any"] = "all",
+        limit: Annotated[int, Query(ge=1)] = 10,
+        offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
+        exact_total: bool = False,
+    ) -> SearchOut:
+        limit = min(limit, settings.max_results)
+        started = time.perf_counter()
+        result = index.search(q, mode=mode, limit=offset + limit, exact_total=exact_total)
+        return SearchOut(
+            query=q,
+            mode=mode,
+            total=result.total,
+            strategy=result.strategy,
+            took_ms=round((time.perf_counter() - started) * 1000, 2),
+            results=[HitOut.of(h) for h in result.hits[offset:]],
+        )
+
+    @app.get("/v1/stats", response_model=StatsOut)
+    def stats() -> StatsOut:
+        s = index.stats()
+        return StatsOut(
+            documents=s.documents,
+            terms=s.terms,
+            block_postings=s.block_postings,
+            delta_postings=s.delta_postings,
+            average_length=s.average_length,
+            queue=queue.counts(),
+            accepted_extensions=supported_extensions(),
+            max_upload_bytes=settings.max_upload_bytes,
+            version=__version__,
+        )
+
+    return app
+
+
+def create_app() -> FastAPI:
+    """Factory for `uvicorn docsearch.service:create_app --factory`."""
+    return create_service_app()

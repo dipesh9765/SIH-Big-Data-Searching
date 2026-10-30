@@ -103,3 +103,7 @@ Blocked / not started:
 Postgres layer (done, tested; ADR 0008): `engine/pg.py` + `pg_schema.sql` (delta table, compactor, snapshot reads, pool); 16 tests compare it with the SQLite reference in every storage state. 300k-document benchmark recorded in the ADR (ingest 1.4k docs/s; compaction must run continuously; faster than Postgres FTS on common-term queries, slower on rare-term queries).
 
 Still open: lazy per-block fetching, deletion, MinIO + ingestion workers and job queue, phrase positions, API wiring (the FastAPI app still uses the SQLite index), OCR / speech / embeddings, React UI, CI for the compose services, a 1M-document run on a bigger machine.
+
+Ingestion (done, tested; ADRs 0009, 0010): S3-compatible object store (SeaweedFS in compose; MinIO images are no longer pullable), content-addressed keys, Postgres job queue with leases/fencing/backoff/dead letters, batch worker with optional background compactor, and an HTTP service (`docsearch.service`: 202 upload, asset status, search, stats, readiness). 25 queue/pipeline tests and 11 service tests against real Postgres; a run with real `uvicorn` and CLI worker processes indexed Hindi, PDF, DOCX, CSV and text files and reported a corrupt PDF with a readable reason.
+
+Still open: OCR / speech / embeddings workers (job kinds exist), phrase positions, deletion, streaming/pre-signed uploads for large media, `/metrics`, the React UI (the old static page targets the SQLite API), CI jobs that start Postgres and the object store, Docker images for api/worker, a 1M-document run on a bigger machine.

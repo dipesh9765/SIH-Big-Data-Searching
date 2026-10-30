@@ -53,6 +53,22 @@ Response (illustrative values):
 }
 ```
 
+## Scale-out mode (PostgreSQL + object store) — in development
+
+Branch `feature/scale-v2` adds a second deployment mode aimed at millions of documents: an inverted index of compressed postings blocks in PostgreSQL, originals in an S3-compatible store, and asynchronous ingestion by workers. The single-file SQLite mode above is unchanged.
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d postgres objects
+pip install -r requirements-dev.txt -e .
+uvicorn docsearch.service:create_app --factory --port 8080      # the API
+python -m docsearch.ingest.worker --compact-interval 20         # one or more workers
+curl -F file=@report.pdf http://127.0.0.1:8080/v1/documents     # 202 + asset id
+curl http://127.0.0.1:8080/v1/assets/1                          # queued / processing / indexed / failed
+curl 'http://127.0.0.1:8080/v1/search?q=glacier'
+```
+
+Measured on 300,000 synthetic documents and what is not yet built: see [PROGRESS.md](PROGRESS.md) and ADRs 0006-0010.
+
 ## API
 
 | Method & path | Purpose |

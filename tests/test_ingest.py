@@ -471,3 +471,52 @@ def test_many_workers_in_parallel_index_everything_exactly_once(
 def test_process_batch_with_no_jobs_is_a_no_op(index: PgIndex, store: MemoryStore) -> None:
     result = process_batch(index, JobQueue(index), store, [], "w1")
     assert (result.indexed, result.retried, result.failed, result.lost) == (0, 0, 0, 0)
+
+
+def test_background_compactor_folds_the_delta_and_stops_on_request(
+    index: PgIndex, store: MemoryStore
+) -> None:
+    from docsearch.ingest.worker import run_compactor
+
+    for n in range(5):
+        submit(index, store, name=f"{n}.txt", data=text_file(n))
+    Worker(index, store, worker_id="w1", batch_size=10).run_once()
+    assert index.stats().delta_postings > 0
+    stop = threading.Event()
+    thread = threading.Thread(target=run_compactor, args=(index, stop, 0.05))
+    thread.start()
+    for _ in range(100):
+        if index.stats().delta_postings == 0:
+            break
+        stop.wait(0.1)
+    stop.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    stats = index.stats()
+    assert stats.delta_postings == 0
+    assert stats.block_postings > 0
+    assert len(index.search("solar power").hits) == 5
+
+
+def test_compactor_survives_a_failing_compaction(
+    index: PgIndex, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docsearch.ingest.worker import run_compactor
+
+    calls = []
+
+    def flaky() -> object:
+        calls.append(1)
+        raise RuntimeError("database restarting")
+
+    monkeypatch.setattr(index, "compact", flaky)
+    stop = threading.Event()
+    thread = threading.Thread(target=run_compactor, args=(index, stop, 0.02))
+    thread.start()
+    for _ in range(100):
+        if len(calls) >= 3:
+            break
+        stop.wait(0.05)
+    stop.set()
+    thread.join(timeout=5)
+    assert len(calls) >= 3  # kept trying after the first failure

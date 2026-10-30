@@ -520,6 +520,39 @@ class PgIndex:
             hits.append(PgHit(document, scored.score, snippet, highlights))
         return hits
 
+    # ---------------------------------------------------------------------------- documents
+
+    _DOCUMENT_COLUMNS = "id, title, source_name, media_type, length, created_at"
+
+    @staticmethod
+    def _document(row: tuple[object, ...]) -> Document:
+        created = row[5]
+        return Document(
+            id=int(row[0]),  # type: ignore[call-overload]
+            title=str(row[1]),
+            source_name=str(row[2]),
+            media_type=str(row[3]),
+            length=int(row[4]),  # type: ignore[call-overload]
+            created_at=created.isoformat(timespec="seconds"),  # type: ignore[attr-defined]
+        )
+
+    def get_document(self, doc_id: int) -> Document | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents WHERE id = %s", (doc_id,)
+            ).fetchone()
+        return None if row is None else self._document(row)
+
+    def list_documents(self, *, limit: int = 50, offset: int = 0) -> list[Document]:
+        """Newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents ORDER BY id DESC"
+                " LIMIT %s OFFSET %s",
+                (limit, offset),
+            ).fetchall()
+        return [self._document(row) for row in rows]
+
     # -------------------------------------------------------------------------- inspection
 
     def stats(self) -> PgStats:

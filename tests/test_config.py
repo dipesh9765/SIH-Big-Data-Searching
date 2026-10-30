@@ -37,3 +37,35 @@ def test_environment_overrides() -> None:
 def test_invalid_values_fail_fast(env: dict[str, str]) -> None:
     with pytest.raises(ValueError, match="DOCSEARCH"):
         Settings.from_env(env)
+
+
+def test_service_settings_defaults_and_overrides() -> None:
+    from docsearch.config import ServiceSettings
+
+    defaults = ServiceSettings.from_env({})
+    assert defaults.schema == "public"
+    assert defaults.s3_secure is False
+    custom = ServiceSettings.from_env(
+        {
+            "DOCSEARCH_DSN": "postgresql://u:p@db/x",
+            "DOCSEARCH_SCHEMA": "s",
+            "DOCSEARCH_S3_ENDPOINT": "s3.example:9000",
+            "DOCSEARCH_S3_SECURE": "true",
+            "DOCSEARCH_MAX_UPLOAD_MB": "2",
+            "DOCSEARCH_MAX_RESULTS": "7",
+        }
+    )
+    assert custom.dsn == "postgresql://u:p@db/x"
+    assert custom.s3_endpoint == "s3.example:9000"
+    assert custom.s3_secure is True
+    assert custom.max_upload_bytes == 2 * 2**20
+    assert custom.max_results == 7
+
+
+def test_service_settings_reject_bad_values() -> None:
+    from docsearch.config import ServiceSettings
+
+    with pytest.raises(ValueError, match="DOCSEARCH_S3_SECURE"):
+        ServiceSettings.from_env({"DOCSEARCH_S3_SECURE": "maybe"})
+    with pytest.raises(ValueError, match="invalid DOCSEARCH"):
+        ServiceSettings.from_env({"DOCSEARCH_MAX_RESULTS": "many"})

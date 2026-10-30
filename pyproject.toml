@@ -46,6 +46,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/docsearch/api.py" = ["PLR0915"]  # create_app registers every route in one factory
+"src/docsearch/service.py" = ["PLR0915"]  # same: one factory registers the routes
 "tests/*" = ["S", "PLR", "PLC0415"]  # PLC0415: importorskip-style local imports
 "benchmarks/*" = ["S", "PLR", "T20"]
 
