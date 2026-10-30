@@ -18,11 +18,13 @@ from __future__ import annotations
 import hashlib
 import logging
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from docsearch.asr import AsrConfig, transcribe
 from docsearch.engine.pg import NewDocument, PgIndex
 from docsearch.extract import (
     IMAGE_MEDIA_TYPES,
@@ -30,6 +32,7 @@ from docsearch.extract import (
     Extracted,
     ExtractionError,
     NeedsOcrError,
+    Unit,
     UnsupportedMediaTypeError,
     clean_filename,
     clean_text,
@@ -190,6 +193,21 @@ def _enqueue(conn: object, asset_id: int, max_attempts: int, kind: str) -> int:
     return int(row[0])
 
 
+class _Throttle:
+    """True at most once per `interval` seconds."""
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._last = time.monotonic()
+
+    def due(self) -> bool:
+        now = time.monotonic()
+        if now - self._last >= self._interval:
+            self._last = now
+            return True
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class _Failure:
     message: str
@@ -201,13 +219,41 @@ class _Reroute:
     kind: str
 
 
+def _transcribe(
+    store: ObjectStore,
+    source_name: str,
+    key: str,
+    asr: AsrConfig,
+    heartbeat: Callable[[float, float], None],
+) -> Extracted:
+    """Download a recording to a scratch file and transcribe it into timestamped units."""
+    suffix = Path(source_name).suffix.lower()
+    if suffix not in SPEECH_MEDIA_TYPES:
+        raise ExtractionError("speech recognition handles audio and video only")
+    with tempfile.TemporaryDirectory(prefix="docsearch-asr-") as scratch:
+        path = (
+            Path(scratch) / f"media{suffix}"
+        )  # an extension from our own whitelist, no client text
+        store.download(key, path)
+        transcript = transcribe(path, asr, on_progress=heartbeat)
+    units = tuple(Unit(clean_text(u.text), u.start_ms, u.end_ms) for u in transcript.units)
+    return Extracted(
+        text=" ".join(u.text for u in units),
+        media_type=SPEECH_MEDIA_TYPES[suffix],
+        units=units,
+        duration_ms=transcript.duration_ms,
+        language=transcript.language,
+    )
+
+
 def _extract(  # noqa: PLR0911, PLR0913, PLR0917 - one return per outcome; plain arguments
     store: ObjectStore,
     source_name: str,
     key: str,
     job: Job,
     ocr: OcrConfig,
-    heartbeat: Callable[[int, int], None],
+    asr: AsrConfig,
+    heartbeat: Callable[[float, float], None],
 ) -> Extracted | _Failure | _Reroute:
     """Fetch and extract one file, sorting failures into permanent and transient.
 
@@ -215,6 +261,8 @@ def _extract(  # noqa: PLR0911, PLR0913, PLR0917 - one return per outcome; plain
     recognise images and the scanned pages of PDFs.
     """
     try:
+        if job.kind == "asr":
+            return _transcribe(store, source_name, key, asr, heartbeat)
         data = store.get(key)
         if job.kind != "ocr":
             return extract_text(source_name, data, detect_scanned=True)
@@ -239,7 +287,7 @@ def _extract(  # noqa: PLR0911, PLR0913, PLR0917 - one return per outcome; plain
         return _Failure(f"{type(exc).__name__}: {exc}", retry=True)
 
 
-def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
+def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration function
     index: PgIndex,
     queue: JobQueue,
     store: ObjectStore,
@@ -247,6 +295,7 @@ def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
     worker_id: str,
     *,
     ocr: OcrConfig | None = None,
+    asr: AsrConfig | None = None,
     lease_seconds: float = 300.0,
 ) -> BatchResult:
     """Extract and index the files behind `jobs`, then settle each job individually.
@@ -265,6 +314,7 @@ def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
             )
         }
     ocr = ocr or OcrConfig()
+    asr = asr or AsrConfig()
     indexed = retried = failed = lost = rerouted = 0
 
     def settle_failure(job: Job, error: str, *, retry: bool) -> None:
@@ -289,10 +339,13 @@ def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
             continue
         source_name, title, key = meta
 
-        def heartbeat(_done: int, _total: int, job: Job = job) -> None:
-            queue.extend(job.id, worker_id, lease_seconds)
+        beat = _Throttle(lease_seconds / 4)
 
-        outcome = _extract(store, source_name, key, job, ocr, heartbeat)
+        def heartbeat(_done: float, _total: float, job: Job = job, beat: _Throttle = beat) -> None:
+            if beat.due():  # per-segment callbacks are frequent; renew the lease only now and then
+                queue.extend(job.id, worker_id, lease_seconds)
+
+        outcome = _extract(store, source_name, key, job, ocr, asr, heartbeat)
         if isinstance(outcome, _Failure):
             settle_failure(job, outcome.message, retry=outcome.retry)
         elif isinstance(outcome, _Reroute):
@@ -305,10 +358,29 @@ def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
     if not ready:
         return result_of()
 
-    documents = [
-        NewDocument(title, assets[job.asset_id][0], extracted.media_type, extracted.text)
-        for job, title, extracted in ready
-    ]
+    documents: list[NewDocument] = []
+    spans: list[tuple[int, int]] = []  # per ready file: its slice of `documents`
+    for job, title, extracted in ready:
+        source_name = assets[job.asset_id][0]
+        begin = len(documents)
+        if extracted.units:
+            documents.extend(
+                NewDocument(
+                    title,
+                    source_name,
+                    extracted.media_type,
+                    unit.text,
+                    asset_id=job.asset_id,
+                    start_ms=unit.start_ms,
+                    end_ms=unit.end_ms,
+                    unit_kind="transcript",
+                    dedupe_key=f"{job.asset_id}:{unit.start_ms}:{unit.text}".encode(),
+                )
+                for unit in extracted.units
+            )
+        else:
+            documents.append(NewDocument(title, source_name, extracted.media_type, extracted.text))
+        spans.append((begin, len(documents)))
     try:
         added = index.add_many_skipping_empty(documents)
     except Exception as exc:
@@ -316,15 +388,29 @@ def process_batch(  # noqa: PLR0912, PLR0913 - one orchestration function
         for job, _, _ in ready:
             settle_failure(job, f"{type(exc).__name__}: {exc}", retry=True)
         return result_of()
-    for (job, _, extracted), result in zip(ready, added, strict=True):
-        if result is None:
-            settle_failure(job, "the file contains no indexable text", retry=False)
+    for (job, _, extracted), (begin, end) in zip(ready, spans, strict=True):
+        results = [r for r in added[begin:end] if r is not None]
+        if not results:
+            reason = (
+                "no speech was recognised"
+                if extracted.units or extracted.duration_ms
+                else ("the file contains no indexable text")
+            )
+            settle_failure(job, reason, retry=False)
             continue
         with index.connection() as conn:
             conn.execute(
                 "UPDATE assets SET status = 'indexed', document_id = %s, error = NULL,"
-                " ocr_confidence = %s, updated_at = now() WHERE id = %s",
-                (result.document_id, extracted.confidence, job.asset_id),
+                " ocr_confidence = %s, units = %s, duration_ms = %s, language = %s,"
+                " updated_at = now() WHERE id = %s",
+                (
+                    results[0].document_id,
+                    extracted.confidence,
+                    len(results),
+                    extracted.duration_ms,
+                    extracted.language,
+                    job.asset_id,
+                ),
             )
         if queue.complete(job.id, worker_id):
             indexed += 1

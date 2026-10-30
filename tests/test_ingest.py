@@ -6,6 +6,7 @@ import codecs
 import os
 import random
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 
@@ -618,15 +619,17 @@ def test_long_ocr_jobs_renew_their_lease_page_by_page(
 
     def fake_pdf(_data: bytes, _config: object = None, on_page: object = None) -> OcrResult:
         for page in range(1, 4):
+            time.sleep(0.03)  # longer than the renewal interval (lease / 4)
             on_page(page, 3)  # type: ignore[operator]
         return OcrResult("recognised words from three pages", 88.0, 3, 3)
 
     monkeypatch.setattr("docsearch.ingest.pipeline.ocr_pdf", fake_pdf)
-    worker = ocr_worker(index, store, lease_seconds=120.0)
+    worker = ocr_worker(index, store, lease_seconds=0.08)  # renew at most every 0.02 s
     monkeypatch.setattr(worker.queue, "extend", spy)
     result = worker.run_once()
     assert result.indexed == 1
-    assert extensions == [120.0, 120.0, 120.0]
+    assert len(extensions) >= 2  # renewed while the pages were being processed...
+    assert set(extensions) == {0.08}  # ...for a full lease each time
     with index.connection() as conn:
         (confidence,) = conn.execute("SELECT ocr_confidence FROM assets").fetchone()  # type: ignore[misc]
     assert confidence == pytest.approx(88.0)

@@ -51,6 +51,14 @@ class NewDocument:
     media_type: str
     text: str
     lang: str = ""
+    # A document may be one stretch (`unit`) of a larger asset, e.g. a minute of a recording.
+    asset_id: int | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    unit_kind: str = "document"
+    # Identical *text* is normally stored once. Units of different assets can legitimately say the
+    # same words ("thank you"), so they supply a key that includes where they came from.
+    dedupe_key: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,11 +68,22 @@ class Added:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaRef:
+    """Where in an uploaded asset a hit comes from (set for units such as transcript segments)."""
+
+    asset_id: int
+    start_ms: int | None
+    end_ms: int | None
+    unit_kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class PgHit:
     document: Document
     score: float
     snippet: str
     highlights: list[tuple[int, int]]
+    media: MediaRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +262,9 @@ class PgIndex:
                     raise EmptyDocumentError(f"document {doc.title!r} contains no indexable text")
                 slots.append(None)
                 continue
-            digest = hashlib.sha256(doc.text.encode("utf-8")).digest()
+            digest = hashlib.sha256(
+                doc.dedupe_key if doc.dedupe_key is not None else doc.text.encode("utf-8")
+            ).digest()
             slots.append(len(prepared))
             prepared.append((doc, frequencies, length, digest))
         if not prepared:
@@ -260,7 +281,7 @@ class PgIndex:
                     continue  # duplicate inside this batch
                 first_seen[digest] = position
                 fresh.append((doc, counts, length, digest))
-            marks = ",".join(["(%s,%s,%s,%s,%s,%s,%s)"] * len(fresh))
+            marks = ",".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * len(fresh))
             for doc, _, length, digest in fresh:
                 values += [
                     doc.title,
@@ -270,10 +291,15 @@ class PgIndex:
                     doc.text,
                     digest,
                     length,
+                    doc.asset_id,
+                    doc.start_ms,
+                    doc.end_ms,
+                    doc.unit_kind,
                 ]
             inserted = conn.execute(
                 "INSERT INTO documents (title, source_name, media_type, lang, content,"
-                f" content_sha256, length) VALUES {marks} ON CONFLICT (content_sha256) DO NOTHING"
+                " content_sha256, length, asset_id, start_ms, end_ms, unit_kind)"
+                f" VALUES {marks} ON CONFLICT (content_sha256) DO NOTHING"
                 " RETURNING id, content_sha256",
                 values,
             ).fetchall()
@@ -500,8 +526,8 @@ class PgIndex:
         rows = {
             r[0]: r
             for r in conn.execute(
-                "SELECT id, title, source_name, media_type, length, created_at, content"
-                " FROM documents WHERE id = ANY(%s)",
+                "SELECT id, title, source_name, media_type, length, created_at, content,"
+                " asset_id, start_ms, end_ms, unit_kind FROM documents WHERE id = ANY(%s)",
                 ([h.doc_id for h in outcome.hits],),
             )
         }
@@ -517,7 +543,8 @@ class PgIndex:
                 length=row[4],
                 created_at=row[5].isoformat(timespec="seconds"),
             )
-            hits.append(PgHit(document, scored.score, snippet, highlights))
+            media = None if row[7] is None else MediaRef(row[7], row[8], row[9], row[10])
+            hits.append(PgHit(document, scored.score, snippet, highlights, media))
         return hits
 
     # ---------------------------------------------------------------------------- documents

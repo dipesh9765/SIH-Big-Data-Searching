@@ -76,3 +76,7 @@ files = ["src", "tests", "benchmarks"]
 [[tool.mypy.overrides]]
 module = ["snowballstemmer", "pytesseract", "PIL", "PIL.*", "pypdfium2"]
 ignore_missing_imports = true  # no type stubs published
+
+[[tool.mypy.overrides]]
+module = ["faster_whisper", "av", "av.*"]
+ignore_missing_imports = true  # optional ASR dependencies; installed in the worker image only

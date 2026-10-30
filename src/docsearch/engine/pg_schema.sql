@@ -92,3 +92,15 @@ CREATE INDEX IF NOT EXISTS ingest_jobs_asset ON ingest_jobs (asset_id);
 
 -- Added with OCR: mean word confidence (0-100) when the text came from OCR, so poor scans can be found.
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS ocr_confidence real;
+
+-- Added with speech-to-text: a document can be one *unit* of a larger asset (a stretch of a
+-- recording), so a search hit can point at a moment. Ordinary documents leave these NULL.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS asset_id  bigint;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS start_ms  integer;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS end_ms    integer;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS unit_kind text NOT NULL DEFAULT 'document';
+CREATE INDEX IF NOT EXISTS documents_asset ON documents (asset_id) WHERE asset_id IS NOT NULL;
+
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS units       integer NOT NULL DEFAULT 1;
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS duration_ms integer;
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS language    text;

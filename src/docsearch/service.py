@@ -77,6 +77,19 @@ class AssetOut(BaseModel):
     error: str | None
     created_at: str
     ocr_confidence: float | None
+    units: int
+    duration_ms: int | None
+    language: str | None
+
+
+class MediaOut(BaseModel):
+    """Where in an uploaded recording this hit is spoken."""
+
+    asset_id: int
+    kind: str
+    start_ms: int | None
+    end_ms: int | None
+    file_url: str  # the original, seekable with HTTP Range
 
 
 class HitOut(BaseModel):
@@ -84,6 +97,7 @@ class HitOut(BaseModel):
     score: float
     snippet: str
     highlights: list[tuple[int, int]]
+    media: MediaOut | None = None
 
     @classmethod
     def of(cls, hit: PgHit) -> HitOut:
@@ -92,6 +106,15 @@ class HitOut(BaseModel):
             score=round(hit.score, 6),
             snippet=hit.snippet,
             highlights=hit.highlights,
+            media=None
+            if hit.media is None
+            else MediaOut(
+                asset_id=hit.media.asset_id,
+                kind=hit.media.unit_kind,
+                start_ms=hit.media.start_ms,
+                end_ms=hit.media.end_ms,
+                file_url=f"/v1/assets/{hit.media.asset_id}/file",
+            ),
         )
 
 
@@ -117,7 +140,8 @@ class StatsOut(BaseModel):
 
 
 _ASSET_COLUMNS = (
-    "id, title, source_name, size, status, document_id, error, created_at, ocr_confidence"
+    "id, title, source_name, size, status, document_id, error, created_at, ocr_confidence,"
+    " units, duration_ms, language"
 )
 
 
@@ -132,6 +156,9 @@ def _asset(row: tuple[object, ...]) -> AssetOut:
         error=row[6],  # type: ignore[arg-type]
         created_at=row[7].isoformat(timespec="seconds"),  # type: ignore[attr-defined]
         ocr_confidence=None if row[8] is None else round(row[8], 1),  # type: ignore[call-overload]
+        units=row[9],  # type: ignore[arg-type]
+        duration_ms=row[10],  # type: ignore[arg-type]
+        language=row[11],  # type: ignore[arg-type]
     )
 
 

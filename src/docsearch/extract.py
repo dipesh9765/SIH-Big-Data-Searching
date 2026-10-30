@@ -66,10 +66,22 @@ class NeedsOcrError(ExtractionError):
 
 
 @dataclass(frozen=True, slots=True)
+class Unit:
+    """A stretch of an asset indexed as its own document (a transcript segment of a recording)."""
+
+    text: str
+    start_ms: int
+    end_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class Extracted:
     text: str
     media_type: str
     confidence: float | None = None  # mean OCR word confidence (0-100), when OCR was used
+    units: tuple[Unit, ...] = ()  # when set, each unit is indexed separately instead of `text`
+    duration_ms: int | None = None  # length of a recording
+    language: str | None = None  # language detected in a recording
 
 
 def clean_filename(name: str) -> str:

@@ -16,8 +16,10 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
+from docsearch import asr as asr_module
+from docsearch.asr import AsrConfig
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import PgIndex
 from docsearch.ingest.objects import ObjectStore, S3Store
@@ -43,6 +45,7 @@ class Worker:
         batch_size: int = 16,
         lease_seconds: float = 300.0,
         ocr: OcrConfig | None = None,
+        asr: AsrConfig | None = None,
     ) -> None:
         self.index = index
         self.store = store
@@ -52,6 +55,7 @@ class Worker:
         self.batch_size = batch_size
         self.lease_seconds = lease_seconds
         self.ocr = ocr or OcrConfig()
+        self.asr = asr or AsrConfig()
 
     def run_once(self) -> BatchResult:
         """Claim and process one batch; an empty result means there was nothing to do."""
@@ -65,6 +69,7 @@ class Worker:
             jobs,
             self.worker_id,
             ocr=self.ocr,
+            asr=self.asr,
             lease_seconds=self.lease_seconds,
         )
 
@@ -143,13 +148,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     settings = ServiceSettings.from_env()
     kinds = args.kinds.split(",")
     ocr = OcrConfig(languages=settings.ocr_languages, max_pages=settings.ocr_max_pages)
-    if "ocr" in kinds:
-        try:
-            check_ready(ocr)  # refuse to run, rather than fail every job, if OCR is not usable
-        except RuntimeError as exc:
-            log.error("cannot start an OCR worker: %s", exc)
-            raise SystemExit(2) from exc
-    heavy = "ocr" in kinds
+    asr = AsrConfig(
+        model=settings.asr_model,
+        model_dir=settings.asr_model_dir,
+        language=settings.asr_language,
+        max_minutes=settings.asr_max_minutes,
+    )
+    checks: dict[str, Callable[[], None]] = {
+        "ocr": lambda: check_ready(ocr),
+        "asr": lambda: asr_module.check_ready(asr),
+    }
+    for kind, check in checks.items():
+        if kind in kinds:
+            try:
+                check()  # refuse to run, rather than fail every job, if the engine is unusable
+            except RuntimeError as exc:
+                log.error("cannot start a %s worker: %s", kind, exc)
+                raise SystemExit(2) from exc
+    heavy = "ocr" in kinds or "asr" in kinds
     with PgIndex(settings.dsn, schema=settings.schema) as index:
         worker = Worker(
             index,
@@ -158,6 +174,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             batch_size=args.batch or (1 if heavy else 16),
             lease_seconds=args.lease or (900.0 if heavy else 300.0),
             ocr=ocr,
+            asr=asr,
         )
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
