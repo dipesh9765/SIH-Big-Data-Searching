@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-# Ingestion worker with OCR: Tesseract (English, Hindi, Marathi) + pypdfium2.
+# Ingestion worker with OCR (Tesseract: English, Hindi, Marathi + pypdfium2) and speech-to-text
+# (faster-whisper; the model is downloaded into the image at build time, so workers run offline).
 #   docker build -f deploy/Dockerfile.worker -t docsearch-worker .
 #   docker build -f deploy/Dockerfile.worker --target test -t docsearch-worker-test .   (with dev tools)
 FROM python:3.13-slim AS base
@@ -11,8 +12,12 @@ ENV PYTHONUNBUFFERED=1 OMP_THREAD_LIMIT=1
 # OMP_THREAD_LIMIT=1: Tesseract's own threading oversubscribes cores when several workers run;
 # scale by running more workers instead.
 WORKDIR /app
-COPY requirements.txt requirements-ocr.txt ./
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt
+COPY requirements.txt requirements-ocr.txt requirements-asr.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt -r requirements-asr.txt
+# Whisper model size: base (~140 MB, fast, weaker on Hindi/Marathi) or small (~480 MB, better).
+ARG ASR_MODEL=base
+ENV DOCSEARCH_ASR_MODEL=${ASR_MODEL} DOCSEARCH_ASR_MODEL_DIR=/models
+RUN python -c "from faster_whisper import WhisperModel; import os; WhisperModel(os.environ['DOCSEARCH_ASR_MODEL'], device='cpu', compute_type='int8', download_root='/models')"  && chmod -R a+rX /models
 
 FROM base AS worker
 COPY pyproject.toml README.md ./
@@ -30,5 +35,5 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
-ENV PYTHONPATH=/app/src:/app
+ENV PYTHONPATH=/app/src:/app PYTHONDONTWRITEBYTECODE=1
 CMD ["pytest", "-q", "--no-cov"]

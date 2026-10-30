@@ -95,6 +95,8 @@ def test_memory_store_round_trip() -> None:
     store.put("k", b"data")
     assert store.exists("k")
     assert store.get("k") == b"data"
+    assert store.size("k") == 4
+    assert store.get_range("k", 1, 2) == b"at"
     store.delete("k")
     assert not store.exists("k")
     with pytest.raises(ObjectNotFoundError):
@@ -118,6 +120,26 @@ def test_s3_store_round_trip_when_a_server_is_available() -> None:
     s3.put(key, b"hello", "text/plain")
     assert s3.exists(key)
     assert s3.get(key) == b"hello"
+    assert s3.size(key) == 5
+    assert s3.get_range(key, 1, 3) == b"ell"
+    assert s3.get_range(key, 3, 100) == b"lo"
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as scratch:
+        source = Path(scratch) / "in.bin"
+        source.write_bytes(b"streamed " * 1000)
+        s3.put_file(key + "-f", source, "application/octet-stream")
+        target = Path(scratch) / "out.bin"
+        s3.download(key + "-f", target)
+        assert target.read_bytes() == source.read_bytes()
+        s3.delete(key + "-f")
+    with pytest.raises(ObjectNotFoundError):
+        s3.size(key + "-f")
+    with pytest.raises(ObjectNotFoundError):
+        s3.get_range(key + "-f", 0, 1)
+    with pytest.raises(ObjectNotFoundError):
+        s3.download(key + "-f", Path("nowhere.bin"))
     s3.delete(key)
     assert not s3.exists(key)
     with pytest.raises(ObjectNotFoundError):

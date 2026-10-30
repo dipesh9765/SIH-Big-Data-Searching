@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import threading
+from pathlib import Path
 from typing import Protocol
 
 from minio import Minio
@@ -27,6 +28,20 @@ class ObjectStore(Protocol):
     def exists(self, key: str) -> bool: ...
 
     def delete(self, key: str) -> None: ...
+
+    def put_file(self, key: str, path: Path, content_type: str = ...) -> None:
+        """Upload a local file without reading it into memory."""
+        ...
+
+    def download(self, key: str, path: Path) -> None:
+        """Write the object to a local file without holding it in memory."""
+        ...
+
+    def size(self, key: str) -> int: ...
+
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        """`length` bytes from `start` (fewer at the end of the object)."""
+        ...
 
     def ping(self) -> None:
         """Raise if the store cannot be reached."""
@@ -65,6 +80,20 @@ class MemoryStore:
     def delete(self, key: str) -> None:
         with self._lock:
             self._objects.pop(key, None)
+
+    def put_file(
+        self, key: str, path: Path, content_type: str = "application/octet-stream"
+    ) -> None:
+        self.put(key, path.read_bytes(), content_type)
+
+    def download(self, key: str, path: Path) -> None:
+        path.write_bytes(self.get(key))
+
+    def size(self, key: str) -> int:
+        return len(self.get(key))
+
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        return self.get(key)[start : start + length]
 
     def ping(self) -> None:
         return None
@@ -114,6 +143,40 @@ class S3Store:
                 return False
             raise
         return True
+
+    def put_file(
+        self, key: str, path: Path, content_type: str = "application/octet-stream"
+    ) -> None:
+        self._client.fput_object(self._bucket, key, str(path), content_type=content_type)
+
+    def download(self, key: str, path: Path) -> None:
+        try:
+            self._client.fget_object(self._bucket, key, str(path))
+        except S3Error as exc:
+            if exc.code in ("NoSuchKey", "NoSuchObject"):
+                raise ObjectNotFoundError(key) from exc
+            raise
+
+    def size(self, key: str) -> int:
+        try:
+            return int(self._client.stat_object(self._bucket, key).size or 0)
+        except S3Error as exc:
+            if exc.code in ("NoSuchKey", "NoSuchObject"):
+                raise ObjectNotFoundError(key) from exc
+            raise
+
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        try:
+            response = self._client.get_object(self._bucket, key, offset=start, length=length)
+        except S3Error as exc:
+            if exc.code in ("NoSuchKey", "NoSuchObject"):
+                raise ObjectNotFoundError(key) from exc
+            raise
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
 
     def delete(self, key: str) -> None:
         self._client.remove_object(self._bucket, key)

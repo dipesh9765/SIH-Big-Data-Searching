@@ -1,0 +1,3 @@
+# Optional speech-to-text for audio and video uploads (CPU, int8). Versions are pinned after the first
+# image build; see deploy/Dockerfile.worker, which also downloads the model into the image.
+faster-whisper>=1.1

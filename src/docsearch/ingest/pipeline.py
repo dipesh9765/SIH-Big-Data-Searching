@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from docsearch.engine.pg import NewDocument, PgIndex
 from docsearch.extract import (
     IMAGE_MEDIA_TYPES,
+    SPEECH_MEDIA_TYPES,
     Extracted,
     ExtractionError,
     NeedsOcrError,
@@ -31,6 +34,7 @@ from docsearch.extract import (
     clean_filename,
     clean_text,
     extract_text,
+    media_type_for,
     service_extensions,
 )
 from docsearch.ingest.objects import ObjectNotFoundError, ObjectStore, object_key
@@ -59,6 +63,35 @@ class BatchResult:
     lost: int = 0  # leases that expired while we worked: another worker owns the job now
 
 
+class TooLargeError(Exception):
+    """The upload exceeds the size limit for its type."""
+
+
+class EmptyUploadError(ValueError):
+    """The upload has no bytes."""
+
+
+UPLOAD_CHUNK = 1024 * 1024
+
+
+def _plan(name: str, title: str | None) -> tuple[str, str, str]:
+    """Validate a file name and decide how it will be processed: (clean name, job kind, title)."""
+    clean = clean_filename(name)
+    suffix = Path(clean).suffix.lower()
+    if suffix not in service_extensions():
+        raise UnsupportedMediaTypeError(
+            f"unsupported file type {suffix or '(none)'!r}; "
+            f"accepted: {', '.join(service_extensions())}"
+        )
+    if suffix in SPEECH_MEDIA_TYPES:
+        kind = "asr"  # audio and video: speech-to-text
+    elif suffix in IMAGE_MEDIA_TYPES:
+        kind = "ocr"  # images always need recognition
+    else:
+        kind = "text"
+    return clean, kind, ((title or "").strip() or clean)[:MAX_TITLE_CHARS]
+
+
 def submit(  # noqa: PLR0913 - one entry point; everything after `store` is keyword-only
     index: PgIndex,
     store: ObjectStore,
@@ -73,23 +106,60 @@ def submit(  # noqa: PLR0913 - one entry point; everything after `store` is keyw
     Uploading bytes that are already stored returns the existing asset instead of a new job. If
     that asset had failed, it is queued again: re-uploading is the way to ask for a retry.
     """
-    clean = clean_filename(name)
-    suffix = Path(clean).suffix.lower()
-    if suffix not in service_extensions():
-        raise UnsupportedMediaTypeError(
-            f"unsupported file type {suffix or '(none)'!r}; "
-            f"accepted: {', '.join(service_extensions())}"
-        )
-    kind = "ocr" if suffix in IMAGE_MEDIA_TYPES else "text"  # images always need recognition
-    shown = ((title or "").strip() or clean)[:MAX_TITLE_CHARS]
+    clean, kind, shown = _plan(name, title)
     digest = hashlib.sha256(data).digest()
     key = object_key(digest.hex())
-    store.put(key, data)  # first: an orphaned object is harmless, a row without its file is not
+    store.put(key, data, media_type_for(clean))  # first: an orphan is harmless, a dangling row not
+    return _register(index, key, digest, len(data), clean, shown, kind, max_attempts)
+
+
+def submit_stream(  # noqa: PLR0913 - one entry point; everything after `store` is keyword-only
+    index: PgIndex,
+    store: ObjectStore,
+    *,
+    name: str,
+    stream: BinaryIO,
+    max_bytes: int,
+    title: str | None = None,
+    max_attempts: int = 5,
+) -> Submission:
+    """Like `submit`, for large uploads: spools `stream` to disk in chunks (hashing as it goes),
+    never holding the file in memory, and uploads it from there. Raises `TooLargeError` as soon as
+    more than `max_bytes` have been read."""
+    clean, kind, shown = _plan(name, title)  # reject by type before reading a byte
+    with tempfile.TemporaryDirectory(prefix="docsearch-upload-") as scratch:
+        path = Path(scratch) / "upload"  # a fixed name: nothing from the client reaches the disk
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("wb") as out:
+            while chunk := stream.read(UPLOAD_CHUNK):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise TooLargeError(f"file exceeds {max_bytes // 2**20} MB")
+                digest.update(chunk)
+                out.write(chunk)
+        if size == 0:
+            raise EmptyUploadError("the file is empty")
+        key = object_key(digest.hexdigest())
+        store.put_file(key, path, media_type_for(clean))
+    return _register(index, key, digest.digest(), size, clean, shown, kind, max_attempts)
+
+
+def _register(  # noqa: PLR0913, PLR0917 - an internal step with plain arguments
+    index: PgIndex,
+    key: str,
+    digest: bytes,
+    size: int,
+    clean: str,
+    shown: str,
+    kind: str,
+    max_attempts: int,
+) -> Submission:
     with index.connection() as conn:
         created = conn.execute(
             "INSERT INTO assets (object_key, sha256, source_name, title, size)"
             " VALUES (%s, %s, %s, %s, %s) ON CONFLICT (sha256) DO NOTHING RETURNING id",
-            (key, digest, clean, shown, len(data)),
+            (key, digest, clean, shown, size),
         ).fetchone()
         if created is not None:
             return Submission(

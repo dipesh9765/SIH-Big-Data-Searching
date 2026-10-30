@@ -22,6 +22,23 @@ MAX_PDF_PAGES = 2_000
 MIN_TEXT_LAYER_CHARS = 25  # OCR keeps a page's own text layer only if it has at least this many
 ROUTING_MIN_CHARS = 5  # non-space characters for a page to count as having text when routing
 SCANNED_PAGE_FRACTION = 0.8  # fewer than this share of pages with text: send the PDF to OCR
+AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".aac": "audio/aac",
+}
+VIDEO_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+}
+SPEECH_MEDIA_TYPES = {**AUDIO_MEDIA_TYPES, **VIDEO_MEDIA_TYPES}
 IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -188,7 +205,15 @@ def service_extensions() -> list[str]:
     """Extensions the scale-out service accepts: images are always accepted there, because the
     API process only queues them and a separate OCR worker reads them."""
     plain = [ext for ext, (mt, _) in _PARSERS.items() if not mt.startswith("image/")]
-    return sorted({*plain, *IMAGE_MEDIA_TYPES})
+    return sorted({*plain, *IMAGE_MEDIA_TYPES, *SPEECH_MEDIA_TYPES})
+
+
+def media_type_for(filename: str) -> str:
+    """Content type to serve a stored file with, from its (already validated) extension."""
+    suffix = PurePosixPath(clean_filename(filename).lower()).suffix
+    if suffix in _PARSERS:
+        return _PARSERS[suffix][0]
+    return {**IMAGE_MEDIA_TYPES, **SPEECH_MEDIA_TYPES}.get(suffix, "application/octet-stream")
 
 
 def extract_text(filename: str, data: bytes, *, detect_scanned: bool = False) -> Extracted:

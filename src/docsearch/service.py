@@ -19,20 +19,33 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import quote
 
-from fastapi import FastAPI, File, Query, Response, UploadFile
+from fastapi import FastAPI, File, Header, Query, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from docsearch import __version__
 from docsearch.api import DocumentOut
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import PgHit, PgIndex
-from docsearch.extract import UnsupportedMediaTypeError, service_extensions
-from docsearch.ingest.objects import ObjectStore
-from docsearch.ingest.pipeline import Submission, submit
+from docsearch.extract import (
+    SPEECH_MEDIA_TYPES,
+    UnsupportedMediaTypeError,
+    media_type_for,
+    service_extensions,
+)
+from docsearch.ingest.objects import ObjectNotFoundError, ObjectStore
+from docsearch.ingest.pipeline import (
+    EmptyUploadError,
+    Submission,
+    TooLargeError,
+    submit_stream,
+)
 from docsearch.ingest.queue import JobQueue
 from docsearch.ingest.worker import build_store
 from docsearch.web import error, install_guard
@@ -122,6 +135,56 @@ def _asset(row: tuple[object, ...]) -> AssetOut:
     )
 
 
+FILE_CHUNK = 1024 * 1024
+
+
+def _parse_range(  # noqa: PLR0911 - one return per header shape
+    header: str | None, total: int
+) -> tuple[int | None, int]:
+    """(start, end) inclusive for a `Range: bytes=a-b` header; (None, 0) if unsatisfiable.
+
+    Supports one range (`a-b`, `a-`, `-n`), which is what browsers send when seeking. No header
+    means the whole file. Multiple ranges are not supported and are treated as unsatisfiable.
+    """
+    if total == 0:
+        return (0, -1) if header is None else (None, 0)
+    if header is None:
+        return 0, total - 1
+    unit, _, spec = header.partition("=")
+    if unit.strip().lower() != "bytes" or "," in spec:
+        return None, 0
+    first, _, last = spec.strip().partition("-")
+    try:
+        if first == "":  # suffix: the last n bytes
+            count = int(last)
+            if count <= 0:
+                return None, 0
+            return max(0, total - count), total - 1
+        begin = int(first)
+        finish = total - 1 if last == "" else min(int(last), total - 1)
+    except ValueError:
+        return None, 0
+    if begin > finish or begin >= total:
+        return None, 0
+    return begin, finish
+
+
+def _chunks(store: ObjectStore, key: str, start: int, end: int) -> Iterator[bytes]:
+    position = start
+    while position <= end:
+        piece = store.get_range(key, position, min(FILE_CHUNK, end - position + 1))
+        if not piece:
+            return
+        yield piece
+        position += len(piece)
+
+
+def _inline_disposition(name: str) -> str:
+    """`inline` with a header-safe file name (ASCII fallback plus the RFC 5987 UTF-8 form)."""
+    ascii_name = name.encode("ascii", "replace").decode().replace('"', "_").replace("\\", "_")
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+
+
 def create_service_app(
     settings: ServiceSettings | None = None,
     *,
@@ -148,7 +211,9 @@ def create_service_app(
         redoc_url=None,
         lifespan=lifespan,
     )
-    install_guard(app, settings.max_upload_bytes)
+    # Audio and video are far larger than documents, so the early body-size check uses the
+    # larger limit and each route enforces the limit for its own type.
+    install_guard(app, max(settings.max_upload_bytes, settings.max_media_bytes))
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -170,15 +235,19 @@ def create_service_app(
         file: Annotated[UploadFile, File(description="A .txt, .md, .csv, .docx or .pdf file")],
         title: Annotated[str | None, Query(max_length=200)] = None,
     ) -> SubmissionOut:
-        data = file.file.read(settings.max_upload_bytes + 1)
-        if len(data) > settings.max_upload_bytes:
-            raise error(413, f"file exceeds {settings.max_upload_bytes // 2**20} MB")
-        if not data:
-            raise error(422, "the file is empty")
+        name = file.filename or ""
+        is_media = Path(name.lower()).suffix in SPEECH_MEDIA_TYPES
+        limit = settings.max_media_bytes if is_media else settings.max_upload_bytes
         try:
-            submission = submit(index, store, name=file.filename or "", data=data, title=title)
+            submission = submit_stream(
+                index, store, name=name, stream=file.file, max_bytes=limit, title=title
+            )
         except UnsupportedMediaTypeError as exc:
             raise error(415, str(exc)) from exc
+        except TooLargeError as exc:
+            raise error(413, str(exc)) from exc
+        except EmptyUploadError as exc:
+            raise error(422, str(exc)) from exc
         except Exception as exc:  # store or database unavailable: the client should retry
             log.error("upload failed: %s", exc)
             raise error(503, "could not accept the upload right now") from exc
@@ -195,6 +264,39 @@ def create_service_app(
         if row is None:
             raise error(404, "asset not found")
         return _asset(row)
+
+    @app.get("/v1/assets/{asset_id}/file")
+    def get_asset_file(
+        asset_id: int, range_header: Annotated[str | None, Header(alias="Range")] = None
+    ) -> Response:
+        """The original file, with HTTP Range support so a browser can seek in audio and video."""
+        with index.connection() as conn:
+            row = conn.execute(
+                "SELECT object_key, source_name FROM assets WHERE id = %s", (asset_id,)
+            ).fetchone()
+        if row is None:
+            raise error(404, "asset not found")
+        key, source_name = row
+        try:
+            total = store.size(key)
+        except ObjectNotFoundError as exc:
+            raise error(404, "the stored file is missing") from exc
+        start, end = _parse_range(range_header, total)
+        if start is None:
+            raise error(416, "unsatisfiable range")
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(end - start + 1),
+            "Content-Disposition": _inline_disposition(source_name),
+        }
+        if range_header is not None:
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return StreamingResponse(
+            _chunks(store, key, start, end),
+            status_code=206 if range_header is not None else 200,
+            media_type=media_type_for(source_name),
+            headers=headers,
+        )
 
     @app.get("/v1/assets", response_model=list[AssetOut])
     def list_assets(

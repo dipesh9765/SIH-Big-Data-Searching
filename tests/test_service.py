@@ -59,7 +59,9 @@ class Rig:
 def rig() -> Iterator[Rig]:
     index = PgIndex(DSN, schema=f"t_{uuid.uuid4().hex[:12]}")
     store = MemoryStore()
-    settings = ServiceSettings(max_upload_bytes=64 * 1024, max_results=5)
+    settings = ServiceSettings(
+        max_upload_bytes=64 * 1024, max_media_bytes=256 * 1024, max_results=5
+    )
     with TestClient(create_service_app(settings, index=index, store=store)) as client:
         yield Rig(client, index, store)
     index.close()
@@ -197,3 +199,94 @@ def test_storage_outage_during_upload_is_a_503_not_a_crash(
     response = rig.upload("a.txt", b"hello world")
     assert response.status_code == 503
     assert "object store" not in response.text  # internals are not leaked to clients
+
+
+# ------------------------------------------------------------------ media upload and file serving
+
+
+@pytest.mark.parametrize(
+    ("header", "total", "expected"),
+    [
+        (None, 100, (0, 99)),
+        ("bytes=0-9", 100, (0, 9)),
+        ("bytes=10-", 100, (10, 99)),
+        ("bytes=-5", 100, (95, 99)),
+        ("bytes=90-500", 100, (90, 99)),  # end clamped to the file
+        ("bytes=100-", 100, (None, 0)),  # starts past the end
+        ("bytes=5-2", 100, (None, 0)),
+        ("bytes=-0", 100, (None, 0)),
+        ("bytes=0-1,5-6", 100, (None, 0)),  # multiple ranges unsupported
+        ("items=0-1", 100, (None, 0)),
+        ("bytes=a-b", 100, (None, 0)),
+        ("bytes=0-1", 0, (None, 0)),
+    ],
+)
+def test_range_header_parsing(
+    header: str | None, total: int, expected: tuple[int | None, int]
+) -> None:
+    from docsearch.service import _parse_range
+
+    assert _parse_range(header, total) == expected
+
+
+def test_audio_and_video_are_accepted_and_queued_for_speech_recognition(rig: Rig) -> None:
+    for name in ("talk.mp3", "clip.mp4", "memo.wav"):
+        response = rig.upload(name, name.encode() * 50)
+        assert response.status_code == 202, name
+    with rig.index.connection() as conn:
+        kinds = [r[0] for r in conn.execute("SELECT kind FROM ingest_jobs ORDER BY id")]
+    assert kinds == ["asr", "asr", "asr"]
+    accepted = rig.client.get("/v1/stats").json()["accepted_extensions"]
+    assert {".mp3", ".mp4", ".mkv", ".flac"} <= set(accepted)
+
+
+def test_media_may_be_larger_than_documents_but_not_larger_than_the_media_limit(rig: Rig) -> None:
+    assert rig.upload("big.mp3", b"a" * (200 * 1024)).status_code == 202  # > 64 KB document limit
+    assert rig.upload("huge.mp3", b"b" * (300 * 1024)).status_code == 413  # > 256 KB media limit
+    assert rig.upload("doc.txt", b"c" * (70 * 1024)).status_code == 413  # > 64 KB document limit
+
+
+def test_the_original_file_is_served_with_range_support(rig: Rig) -> None:
+    payload = bytes(range(256)) * 40  # 10,240 bytes
+    asset = rig.upload("clip.mp3", payload).json()["asset_id"]
+    full = rig.client.get(f"/v1/assets/{asset}/file")
+    assert full.status_code == 200
+    assert full.content == payload
+    assert full.headers["accept-ranges"] == "bytes"
+    assert full.headers["content-type"] == "audio/mpeg"
+    assert full.headers["content-disposition"].startswith('inline; filename="clip.mp3"')
+    part = rig.client.get(f"/v1/assets/{asset}/file", headers={"Range": "bytes=100-199"})
+    assert part.status_code == 206
+    assert part.content == payload[100:200]
+    assert part.headers["content-range"] == f"bytes 100-199/{len(payload)}"
+    tail = rig.client.get(f"/v1/assets/{asset}/file", headers={"Range": "bytes=-16"})
+    assert tail.content == payload[-16:]
+    assert (
+        rig.client.get(f"/v1/assets/{asset}/file", headers={"Range": "bytes=999999-"}).status_code
+        == 416
+    )
+    assert rig.client.get("/v1/assets/999999/file").status_code == 404
+
+
+def test_a_missing_object_behind_an_asset_is_a_404_not_a_500(rig: Rig) -> None:
+    asset = rig.upload("a.mp3", b"audio bytes " * 20).json()["asset_id"]
+    rig.store.delete(next(iter(rig.store._objects)))
+    assert rig.client.get(f"/v1/assets/{asset}/file").status_code == 404
+
+
+def test_streaming_upload_stops_reading_at_the_limit(rig: Rig) -> None:
+    import io
+
+    from docsearch.ingest.pipeline import TooLargeError, submit_stream
+
+    class Counting(io.BytesIO):
+        reads = 0
+
+        def read(self, size: int | None = -1) -> bytes:
+            Counting.reads += 1
+            return super().read(size)
+
+    stream = Counting(b"x" * (10 * 2**20))
+    with pytest.raises(TooLargeError):
+        submit_stream(rig.index, rig.store, name="a.mp3", stream=stream, max_bytes=1 * 2**20)
+    assert Counting.reads <= 3  # 1 MiB chunks: stopped just past the limit, not after 10 MiB
