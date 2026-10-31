@@ -33,7 +33,7 @@ from psycopg import IsolationLevel
 from psycopg_pool import ConnectionPool
 
 from docsearch.analysis import query_terms, term_frequencies
-from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, iter_postings
+from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, encode_block, iter_postings
 from docsearch.engine.search import Mode, Outcome, Pruning, search
 from docsearch.index import Document, EmptyDocumentError, make_snippet
 
@@ -101,6 +101,13 @@ class CompactionStats:
 
 
 @dataclass(frozen=True, slots=True)
+class PurgeStats:
+    documents: int = 0
+    postings: int = 0
+    skipped: bool = False  # the compactor is running
+
+
+@dataclass(frozen=True, slots=True)
 class PgStats:
     documents: int
     terms: int
@@ -142,16 +149,18 @@ class _LengthCache:
 class _Snapshot:
     """A `PostingsSource` over data already fetched inside one database snapshot."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917 - a plain bundle of already-fetched snapshot data
         self,
         doc_count: int,
         average_length: float,
         freqs: dict[str, int],
         blocks: dict[str, list[Block]],
         lengths: npt.NDArray[np.int64],
+        excluded: frozenset[int],
     ) -> None:
         self.doc_count = doc_count
         self.average_length = average_length
+        self.excluded = excluded
         self._freqs = freqs
         self._blocks = blocks
         self._lengths = lengths
@@ -188,6 +197,7 @@ class PgIndex:
         self._dsn = dsn
         self._schema = schema
         self._lengths = _LengthCache()
+        self._deleted_cache: tuple[int, frozenset[int]] = (-1, frozenset())
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
         # Opening a connection costs more than a small query (~10 ms here), so connections are
@@ -525,7 +535,8 @@ class PgIndex:
             )
         freqs = {term: df + len(delta[term]) for term, (_, df) in info.items()}
         blocks = {term: _merge(compacted[term], delta[term], lengths) for term in info}
-        return _Snapshot(doc_count, average, freqs, blocks, lengths)
+        excluded = self._deleted_ids(conn, int(meta.get("deletions", 0)))
+        return _Snapshot(doc_count, average, freqs, blocks, lengths, excluded)
 
     @staticmethod
     def _hits(conn: psycopg.Connection, outcome: Outcome, terms: set[str]) -> list[PgHit]:
@@ -555,6 +566,152 @@ class PgIndex:
             hits.append(PgHit(document, scored.score, snippet, highlights, media))
         return hits
 
+    # ----------------------------------------------------------------------------- deletion
+
+    def _deleted_ids(self, conn: psycopg.Connection, version: int) -> frozenset[int]:
+        """Ids of tombstoned documents, cached until the `deletions` counter changes."""
+        cached_version, cached = self._deleted_cache
+        if cached_version == version:
+            return cached
+        ids = frozenset(
+            r[0] for r in conn.execute("SELECT id FROM documents WHERE deleted_at IS NOT NULL")
+        )
+        self._deleted_cache = (version, ids)
+        return ids
+
+    def delete_documents(self, ids: Sequence[int]) -> int:
+        """Remove documents from search immediately. Returns how many were live.
+
+        The tombstone excludes them from every query at once; `purge_deleted` later removes their
+        postings and text. Their content hash is replaced so the same text can be indexed again.
+        """
+        if not ids:
+            return 0
+        tombstones = [hashlib.sha256(f"deleted:{doc_id}".encode()).digest() for doc_id in ids]
+        with self._connect() as conn:
+            rows = conn.execute(
+                "UPDATE documents d SET deleted_at = now(), content_sha256 = v.hash"
+                " FROM (SELECT unnest(%s::bigint[]) AS id, unnest(%s::bytea[]) AS hash) v"
+                " WHERE d.id = v.id AND d.deleted_at IS NULL RETURNING d.id, d.length",
+                (list(ids), tombstones),
+            ).fetchall()
+            if rows:
+                for key, delta in (
+                    ("doc_count", -len(rows)),
+                    ("total_length", -sum(r[1] for r in rows)),
+                    ("deletions", 1),
+                    ("generation", 1),
+                ):
+                    conn.execute("UPDATE meta SET value = value + %s WHERE key = %s", (delta, key))
+        return len(rows)
+
+    def purge_deleted(self, *, batch: int = 200) -> PurgeStats:
+        """Remove the postings of deleted documents and clear their text.
+
+        Finds a document's terms by analysing its stored text again, so it depends on the analyzer
+        being unchanged since indexing. If it ever is not, a posting can survive; the tombstone
+        still keeps it out of results, so the cost is space and a slightly high document
+        frequency, never a wrong answer. Runs under the compaction lock (both rewrite blocks).
+        """
+        with psycopg.connect(self._dsn, autocommit=True) as guard:
+            locked = guard.execute(
+                "SELECT pg_try_advisory_lock(%s, hashtext(%s))", (_COMPACT_LOCK, self._schema)
+            ).fetchone()
+            if locked is None or not locked[0]:
+                return PurgeStats(skipped=True)
+            docs = postings = 0
+            while True:
+                with self._connect() as conn:
+                    done, removed = self._purge_batch(conn, batch)
+                if done == 0:
+                    return PurgeStats(docs, postings)
+                docs += done
+                postings += removed
+
+    def _purge_batch(self, conn: psycopg.Connection, batch: int) -> tuple[int, int]:
+        rows = conn.execute(
+            "SELECT id, content FROM documents WHERE deleted_at IS NOT NULL AND purged_at IS NULL"
+            " ORDER BY id LIMIT %s",
+            (batch,),
+        ).fetchall()
+        if not rows:
+            return 0, 0
+        lengths = self._lengths.refresh(conn)
+        vocabulary = sorted({t for _, text in rows for t in term_frequencies(text)[0]})
+        term_ids = {
+            term: term_id
+            for term_id, term in conn.execute(
+                "SELECT id, term FROM terms WHERE term = ANY(%s)", (vocabulary,)
+            )
+        }
+        removed = 0
+        conn.execute(
+            "DELETE FROM postings_delta WHERE doc_id = ANY(%s)", ([doc_id for doc_id, _ in rows],)
+        )
+        pending: dict[tuple[int, int], set[int]] = {}  # (term id, block no) -> doc ids to drop
+        found: dict[tuple[int, int], tuple[Block, int]] = {}
+        for doc_id, text in rows:
+            for term in term_frequencies(text)[0]:
+                term_id = term_ids.get(term)
+                if term_id is None:
+                    continue
+                row = conn.execute(
+                    "SELECT block_no, first_doc, last_doc, count, max_tf, min_len, payload"
+                    " FROM postings_blocks"
+                    " WHERE term_id = %s AND first_doc <= %s AND last_doc >= %s",
+                    (term_id, doc_id, doc_id),
+                ).fetchone()
+                if row is None:
+                    continue
+                key = (term_id, row[0])
+                found[key] = (Block(row[1], row[2], row[3], row[4], row[5], bytes(row[6])), row[0])
+                pending.setdefault(key, set()).add(doc_id)
+        decrements: dict[int, int] = {}
+        for (term_id, block_no), drop in pending.items():
+            block, _ = found[(term_id, block_no)]
+            ids, tfs = block.decode()
+            keep = [(i, t) for i, t in zip(ids, tfs, strict=True) if i not in drop]
+            gone = len(ids) - len(keep)
+            if gone == 0:
+                continue
+            removed += gone
+            decrements[term_id] = decrements.get(term_id, 0) + gone
+            if not keep:
+                conn.execute(
+                    "DELETE FROM postings_blocks WHERE term_id = %s AND block_no = %s",
+                    (term_id, block_no),
+                )
+                continue
+            new = encode_block(
+                [i for i, _ in keep], [t for _, t in keep], [int(lengths[i]) for i, _ in keep]
+            )
+            conn.execute(
+                "UPDATE postings_blocks SET first_doc = %s, last_doc = %s, count = %s, max_tf = %s,"
+                " min_len = %s, payload = %s WHERE term_id = %s AND block_no = %s",
+                (
+                    new.first_doc,
+                    new.last_doc,
+                    new.count,
+                    new.max_tf,
+                    new.min_len,
+                    new.payload,
+                    term_id,
+                    block_no,
+                ),
+            )
+        if decrements:
+            conn.execute(
+                "UPDATE terms t SET doc_freq = greatest(t.doc_freq - v.n, 0) FROM"
+                " (SELECT unnest(%s::bigint[]) AS id, unnest(%s::int[]) AS n) v WHERE t.id = v.id",
+                (list(decrements), list(decrements.values())),
+            )
+        conn.execute(
+            "UPDATE documents SET purged_at = now(), content = '' WHERE id = ANY(%s)",
+            ([doc_id for doc_id, _ in rows],),
+        )
+        conn.execute("UPDATE meta SET value = value + 1 WHERE key = 'generation'")
+        return len(rows), removed
+
     # ---------------------------------------------------------------------------- documents
 
     _DOCUMENT_COLUMNS = "id, title, source_name, media_type, length, created_at"
@@ -574,7 +731,9 @@ class PgIndex:
     def get_document(self, doc_id: int) -> Document | None:
         with self._connect() as conn:
             row = conn.execute(
-                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents WHERE id = %s", (doc_id,)
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents"
+                " WHERE id = %s AND deleted_at IS NULL",
+                (doc_id,),
             ).fetchone()
         return None if row is None else self._document(row)
 
@@ -582,7 +741,8 @@ class PgIndex:
         """Newest first."""
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents ORDER BY id DESC"
+                f"SELECT {self._DOCUMENT_COLUMNS} FROM documents WHERE deleted_at IS NULL"
+                " ORDER BY id DESC"
                 " LIMIT %s OFFSET %s",
                 (limit, offset),
             ).fetchall()

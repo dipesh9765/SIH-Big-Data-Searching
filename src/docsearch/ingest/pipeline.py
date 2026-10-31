@@ -186,6 +186,38 @@ def _register(  # noqa: PLR0913, PLR0917 - an internal step with plain arguments
         return Submission(asset_id, None, status, True)
 
 
+def delete_asset(index: PgIndex, store: ObjectStore, asset_id: int) -> bool:
+    """Remove an upload: its searchable text, its jobs, its row and the stored original.
+
+    Order matters for crash safety: the documents are tombstoned first (idempotent), so a crash
+    afterwards leaves an asset that can simply be deleted again, never searchable text without an
+    owner. A text shared with another asset (identical content) is kept for that asset.
+    """
+    with index.connection() as conn:
+        row = conn.execute(
+            "SELECT object_key, document_id FROM assets WHERE id = %s", (asset_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        key, document_id = row
+        ids = [
+            r[0] for r in conn.execute("SELECT id FROM documents WHERE asset_id = %s", (asset_id,))
+        ]
+        if document_id is not None and document_id not in ids:
+            shared = conn.execute(
+                "SELECT 1 FROM assets WHERE document_id = %s AND id <> %s LIMIT 1",
+                (document_id, asset_id),
+            ).fetchone()
+            if shared is None:
+                ids.append(document_id)
+    index.delete_documents(ids)
+    with index.connection() as conn:
+        conn.execute("DELETE FROM ingest_jobs WHERE asset_id = %s", (asset_id,))
+        conn.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
+    store.delete(key)
+    return True
+
+
 def _enqueue(conn: object, asset_id: int, max_attempts: int, kind: str, channel: str) -> int:
     row = conn.execute(  # type: ignore[attr-defined]
         "INSERT INTO ingest_jobs (asset_id, kind, max_attempts) VALUES (%s, %s, %s) RETURNING id",
@@ -401,7 +433,7 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
             settle_failure(job, reason, retry=False)
             continue
         with index.connection() as conn:
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE assets SET status = 'indexed', document_id = %s, error = NULL,"
                 " ocr_confidence = %s, units = %s, duration_ms = %s, language = %s,"
                 " updated_at = now() WHERE id = %s",
@@ -414,6 +446,13 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
                     job.asset_id,
                 ),
             )
+        if updated.rowcount == 0:
+            # The asset was deleted while we were working on it. Undo what we just indexed, or
+            # its text would stay searchable with nothing left to point at.
+            index.delete_documents([r.document_id for r in results if not r.duplicate])
+            queue.complete(job.id, worker_id)
+            lost += 1
+            continue
         if queue.complete(job.id, worker_id):
             indexed += 1
         else:

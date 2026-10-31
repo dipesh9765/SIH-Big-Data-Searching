@@ -23,6 +23,7 @@ class MemoryIndex:
         self._blocks: dict[str, list[Block]] = {}
         self.doc_count = 0
         self.average_length = 0.0
+        self.excluded: frozenset[int] = frozenset()
         self._total_length = 0
         self._table: npt.NDArray[np.int64] | None = None
 

@@ -45,6 +45,8 @@ class PostingsSource(Protocol):
 
     doc_count: int
     average_length: float
+    # Documents deleted but possibly still present in postings; they must never be returned.
+    excluded: frozenset[int]
 
     def doc_freq(self, term: str) -> int: ...
 
@@ -275,6 +277,9 @@ def _scan(source: PostingsSource, known: Sequence[tuple[str, int]], mode: Mode, 
         norm = BM25_K1 * (1.0 - BM25_B + BM25_B * lengths[doc_ids] / average)
         accumulated[doc_ids] += idf * tf * (BM25_K1 + 1.0) / (tf + norm)
         matched[doc_ids] += 1
+    if source.excluded:
+        gone = np.fromiter(source.excluded, dtype=np.int64, count=len(source.excluded))
+        matched[gone[gone < len(matched)]] = 0
     needed = len(known) if mode == "all" else 1
     candidates = np.flatnonzero(matched >= needed)
     stats = SearchStats(decoded, postings, decoded, "scan-all" if mode == "all" else "scan-any")
@@ -302,6 +307,7 @@ def _stats(cursors: Sequence[_Cursor], scored: int, strategy: str) -> SearchStat
 
 def _and(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
     """Every term must match. Drive from the rarest list and skip the others forward to it."""
+    excluded = source.excluded
     cursors.sort(key=lambda c: len(c._blocks))
     lead, rest = cursors[0], cursors[1:]
     top = _TopK(k)
@@ -329,13 +335,15 @@ def _and(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
         length = source.length(doc)
         score = sum(bm25_term_score(c.idf, c.tf(), length, source.average_length) for c in cursors)
         scored += 1
-        top.offer(doc, score)
+        if doc not in excluded:
+            top.offer(doc, score)
         lead.next()
     return Outcome(top.result(), _stats(cursors, scored, "and-skip"), None)
 
 
 def _wand(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
     """At least one term must match: block-max WAND (Ding & Suel, 2011)."""
+    excluded = source.excluded
     top = _TopK(k)
     scored = 0
     while True:
@@ -357,7 +365,8 @@ def _wand(source: PostingsSource, cursors: list[_Cursor], k: int) -> Outcome:
             total += bm25_term_score(cursor.idf, cursor.tf(), length, source.average_length)
             cursor.next()
         scored += 1
-        top.offer(doc, total)
+        if doc not in excluded:
+            top.offer(doc, total)
     return Outcome(top.result(), _stats(cursors, scored, "wand"), None)
 
 

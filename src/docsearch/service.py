@@ -17,6 +17,7 @@ do the indexing; this process never extracts text.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -25,7 +26,17 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, Header, Query, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -44,6 +55,7 @@ from docsearch.ingest.pipeline import (
     EmptyUploadError,
     Submission,
     TooLargeError,
+    delete_asset,
     submit_stream,
 )
 from docsearch.ingest.queue import JobQueue
@@ -264,7 +276,27 @@ def create_service_app(
         if owns_index:
             index.close()
 
+    def require_key(
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> None:
+        """When DOCSEARCH_API_KEY is set, every /v1 route needs it (Bearer or X-API-Key). Health,
+        readiness, metrics and the docs page are left open for probes and scrapers."""
+        if not settings.api_key or not request.url.path.startswith("/v1"):
+            return
+        supplied = x_api_key or (
+            authorization[7:] if authorization and authorization[:7].lower() == "bearer " else ""
+        )
+        if not hmac.compare_digest(supplied.encode(), settings.api_key.encode()):
+            raise HTTPException(
+                status_code=401,
+                detail="missing or invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     app = FastAPI(
+        dependencies=[Depends(require_key)],
         title="docsearch service",
         version=__version__,
         docs_url="/docs",
@@ -362,6 +394,19 @@ def create_service_app(
             media_type=media_type_for(source_name),
             headers=headers,
         )
+
+    @app.delete("/v1/assets/{asset_id}", status_code=204)
+    def remove_asset(asset_id: int) -> Response:
+        """Delete an upload: it leaves search at once; its original is removed from storage."""
+        if not delete_asset(index, store, asset_id):
+            raise error(404, "asset not found")
+        return Response(status_code=204)
+
+    @app.delete("/v1/documents/{doc_id}", status_code=204)
+    def remove_document(doc_id: int) -> Response:
+        if index.delete_documents([doc_id]) == 0:
+            raise error(404, "document not found")
+        return Response(status_code=204)
 
     @app.get("/v1/assets", response_model=list[AssetOut])
     def list_assets(

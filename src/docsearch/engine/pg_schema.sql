@@ -104,3 +104,13 @@ CREATE INDEX IF NOT EXISTS documents_asset ON documents (asset_id) WHERE asset_i
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS units       integer NOT NULL DEFAULT 1;
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS duration_ms integer;
 ALTER TABLE assets ADD COLUMN IF NOT EXISTS language    text;
+
+-- Deletion: a document is tombstoned (deleted_at) and excluded from every search at once; a later
+-- purge removes its postings and clears its text (purged_at). The tombstone is never removed, so
+-- a posting the purge fails to find can still never be returned.
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS purged_at  timestamptz;
+CREATE INDEX IF NOT EXISTS documents_deleted ON documents (id) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS documents_unpurged ON documents (id)
+    WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
+INSERT INTO meta (key, value) VALUES ('deletions', 0) ON CONFLICT (key) DO NOTHING;
