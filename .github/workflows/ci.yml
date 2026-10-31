@@ -8,11 +8,24 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  python:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python: ["3.12", "3.13"]
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: docsearch
+          POSTGRES_PASSWORD: docsearch_dev
+          POSTGRES_DB: docsearch
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docsearch" --health-interval 3s --health-timeout 3s
+          --health-retries 20
+    env:
+      DOCSEARCH_TEST_DSN: postgresql://docsearch:docsearch_dev@127.0.0.1:5433/docsearch
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,17 +33,78 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: requirements-dev.txt
-      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+      - name: S3-compatible server for the object-store tests
+        run: |
+          docker run -d --name s3 -p 8333:8333 \
+            -v "$PWD/deploy/s3.json:/etc/seaweedfs/s3.json:ro" \
+            chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860 \
+            server -dir=/data -volume.max=0 -master.volumeSizeLimitMB=256 -s3 -s3.port=8333 \
+            -s3.config=/etc/seaweedfs/s3.json
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-hin tesseract-ocr-mar
       - run: pip install -r requirements-dev.txt -r requirements-ocr.txt -e .
       - run: ruff check . && ruff format --check .
       - run: mypy
-      - run: pytest --cov   # coverage gate (90%) is in pyproject.toml; OCR test runs here
+      - run: pytest --cov   # coverage gate (90%) is in pyproject.toml
       - name: Benchmark smoke (small corpus, must complete and find known items)
         run: python benchmarks/bench.py --docs 300 --tokens 100 --queries 30 --json | tee bench.json && python -c "import json; assert json.load(open('bench.json'))['known_item_recall_at_1'] >= 0.95"
 
-  docker:
+  web:
     runs-on: ubuntu-latest
-    needs: test
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # The real OCR, speech-to-text and embedding models live in the worker image; this job runs the
+  # whole suite inside it (the Python job above skips those tests). Slow: it downloads the models.
+  containers:
+    runs-on: ubuntu-latest
+    needs: python
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: docsearch
+          POSTGRES_PASSWORD: docsearch_dev
+          POSTGRES_DB: docsearch
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docsearch" --health-interval 3s --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/Dockerfile.worker --target test -t docsearch-worker-test .
+      - name: Whole suite, with real Tesseract, Whisper and embedding models
+        run: |
+          docker run --rm --network host -v "$PWD:/app" \
+            -e DOCSEARCH_TEST_DSN=postgresql://docsearch:docsearch_dev@127.0.0.1:5433/docsearch \
+            docsearch-worker-test pytest -q --no-cov -p no:cacheprovider tests
+
+  stack:
+    runs-on: ubuntu-latest
+    needs: [python, web]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f deploy/docker-compose.yml --profile app up -d --build
+      - name: End-to-end smoke test (upload, index, search)
+        run: ./deploy/smoke.sh http://127.0.0.1:8080
+      - if: failure()
+        run: docker compose -f deploy/docker-compose.yml --profile app logs --no-color --tail=100
+
+  single-node-image:
+    runs-on: ubuntu-latest
+    needs: python
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t docsearch .

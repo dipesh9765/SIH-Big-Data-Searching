@@ -10,3 +10,8 @@ tests
 benchmarks
 *.db*
 .env
+web/node_modules
+web/dist
+docs
+*.bundle
+.github

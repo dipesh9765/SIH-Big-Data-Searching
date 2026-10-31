@@ -42,10 +42,33 @@ services:
       - objectdata:/data
       - ./s3.json:/etc/seaweedfs/s3.json:ro
 
-  # OCR worker (Tesseract: English, Hindi, Marathi). Optional: `--profile ocr up -d worker-ocr`.
-  worker-ocr:
-    profiles: ["ocr"]
+  # ---- the application (profile "app"): `docker compose --profile app up -d --build` ----------
+  api:
+    profiles: ["app"]
     build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        SEMANTIC: ${DOCSEARCH_SEMANTIC_BUILD:-0}  # 1: include the packages and models for semantic search
+    depends_on:
+      - postgres
+      - objects
+    environment: &app-env
+      DOCSEARCH_DSN: postgresql://docsearch:${POSTGRES_PASSWORD:-docsearch_dev}@postgres:5432/docsearch
+      DOCSEARCH_SCHEMA: ${DOCSEARCH_SCHEMA:-public}
+      DOCSEARCH_S3_ENDPOINT: objects:8333
+      DOCSEARCH_S3_BUCKET: ${DOCSEARCH_S3_BUCKET:-docsearch}
+      DOCSEARCH_API_KEY: ${DOCSEARCH_API_KEY:-}
+      DOCSEARCH_SEMANTIC: ${DOCSEARCH_SEMANTIC:-}  # 1 turns on embeddings, semantic and image search
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8000"
+    restart: unless-stopped
+
+  # Text/PDF/DOCX/CSV worker: also compacts the index and does housekeeping.
+  worker:
+    profiles: ["app"]
+    image: docsearch-worker
+    build: &worker-build
       context: ..
       dockerfile: deploy/Dockerfile.worker
       target: worker
@@ -53,17 +76,65 @@ services:
       - postgres
       - objects
     environment:
-      DOCSEARCH_DSN: postgresql://docsearch:${POSTGRES_PASSWORD:-docsearch_dev}@postgres:5432/docsearch
-      DOCSEARCH_SCHEMA: ${DOCSEARCH_SCHEMA:-public}
-      DOCSEARCH_S3_ENDPOINT: objects:8333
-      DOCSEARCH_S3_BUCKET: ${DOCSEARCH_S3_BUCKET:-docsearch}
+      <<: *app-env
+    command: ["--kinds", "text", "--compact-interval", "10", "--maintenance-interval", "3600"]
+    restart: unless-stopped
+
+  # OCR worker (Tesseract: English, Hindi, Marathi) for images and scanned PDFs.
+  worker-ocr:
+    profiles: ["app", "ocr"]
+    image: docsearch-worker
+    build: *worker-build
+    depends_on:
+      - postgres
+      - objects
+    environment:
+      <<: *app-env
       DOCSEARCH_OCR_LANGS: ${DOCSEARCH_OCR_LANGS:-eng+hin+mar}
+    command: ["--kinds", "ocr"]
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 1g
           cpus: "2"
+
+  # Speech-to-text worker for audio and video (faster-whisper; the model is in the image).
+  worker-asr:
+    profiles: ["asr"]
+    image: docsearch-worker
+    build: *worker-build
+    depends_on:
+      - postgres
+      - objects
+    environment:
+      <<: *app-env
+      DOCSEARCH_ASR_LANGUAGE: ${DOCSEARCH_ASR_LANGUAGE:-}
+    command: ["--kinds", "asr"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+          cpus: "4"
+
+  # Embedding worker for semantic and image search. Also set DOCSEARCH_SEMANTIC=1 and build the API
+  # with DOCSEARCH_SEMANTIC_BUILD=1 so it can embed queries.
+  worker-embed:
+    profiles: ["semantic"]
+    image: docsearch-worker
+    build: *worker-build
+    depends_on:
+      - postgres
+      - objects
+    environment:
+      <<: *app-env
+    command: ["--kinds", "embed"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
 
 volumes:
   pgdata:

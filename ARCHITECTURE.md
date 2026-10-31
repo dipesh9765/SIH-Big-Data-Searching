@@ -1,127 +1,162 @@
 # Architecture
 
-docsearch is a small full-text search engine: it turns uploaded documents into an **inverted index**, ranks matches with **BM25**, and serves both through an HTTP API and a single-page UI. It is one process with one storage file; the interesting part is the index, not the plumbing.
+docsearch turns uploads of many kinds into an **inverted index in PostgreSQL** and answers keyword, boolean, phrase and semantic queries. Ingestion is asynchronous and scales by adding worker processes; reads are served from consistent database snapshots. This document describes what exists, why, and where it stops scaling. Each choice has an ADR in [docs/adr](docs/adr).
 
 ## Components
 
 ```mermaid
-flowchart LR
-    UI[Browser UI<br/>static/app.js] -->|multipart upload / GET search| API
-    Client[curl / other clients] --> API
-    subgraph Service["FastAPI service (api.py)"]
-        API[Routes + validation<br/>size, type, limits]
-        MW[Middleware<br/>request id, security headers,<br/>declared-length guard]
-        API --- MW
+flowchart TB
+    subgraph Clients
+        UI[Web UI] 
+        CURL[API clients]
     end
-    API -->|bytes| EX[extract.py<br/>txt md csv docx pdf ocr]
-    EX -->|text| IDX
-    API -->|query| IDX
-    subgraph Core["Search core"]
-        AN[analysis.py<br/>tokenise → stop words → stem]
-        IDX[index.py<br/>Index: add / delete / search]
-        AN --- IDX
+    subgraph API["API process (FastAPI)"]
+        R[routes + auth + limits]
+        Q[query engine<br/>parse · plan · evaluate]
+        EMB[query embedder<br/>optional]
     end
-    IDX <--> DB[(SQLite, WAL<br/>documents · terms · postings · meta)]
+    subgraph Workers
+        T[text worker]
+        O[ocr worker]
+        A[asr worker]
+        E[embed worker]
+        C[compactor + housekeeping]
+    end
+    OBJ[(object store<br/>originals, content-addressed)]
+    PG[("PostgreSQL<br/>documents, terms,<br/>postings_blocks, postings_delta,<br/>assets, ingest_jobs, pgvector")]
+    UI & CURL --> R
+    R -->|stream upload| OBJ
+    R -->|asset + job: one txn| PG
+    R --> Q --> PG
+    R -.-> EMB
+    T & O & A & E -->|claim: SKIP LOCKED| PG
+    T & O & A & E --> OBJ
+    C --> PG
 ```
 
-| Module | Responsibility | Knows about |
-|--------|----------------|-------------|
-| `analysis.py` | Text → terms. One function used at index time **and** query time | nothing else |
-| `extract.py` | Bytes + file name → text, with size/zip-bomb/page limits | nothing else |
-| `index.py` | Storage, BM25 scoring, snippets, transactions | `analysis` |
-| `api.py` | HTTP, validation, error mapping, headers | all of the above |
-| `config.py` | Environment → typed `Settings` | nothing else |
-
-The dependency direction is strictly downward, so `analysis`, `extract` and `index` are unit-testable without HTTP.
+The API never extracts text. It stores the file, records an `asset` and a `job` in one transaction, and returns `202`. A worker of the right *kind* claims the job under a lease, extracts text (or transcribes, or embeds), writes documents and postings, and settles the job. Kinds are separate pools because their costs differ by orders of magnitude: a text job takes milliseconds, an OCR page seconds, a minute of speech tens of seconds.
 
 ## Data model
 
 ```mermaid
 erDiagram
-    documents ||--o{ postings : "is listed in"
-    terms ||--o{ postings : "has"
+    assets ||--o{ ingest_jobs : "has"
+    assets ||--o{ documents : "units of (recordings)"
+    documents ||--o{ text_embeddings : "passages"
+    assets ||--o| image_embeddings : "picture"
+    terms ||--o{ postings_blocks : "compressed lists"
+    terms ||--o{ postings_delta : "new, uncompacted"
+    documents ||--o{ postings_delta : "doc_id"
+    assets {
+        bigint id PK
+        bytea sha256 UK "identical bytes stored once"
+        text object_key UK "assets/ab/<sha256>"
+        text status "queued processing indexed failed"
+        real ocr_confidence
+        int units
+        int duration_ms
+    }
+    ingest_jobs {
+        bigint id PK
+        text kind "text ocr asr embed"
+        text state "queued running done dead"
+        int attempts
+        timestamptz locked_until "the lease"
+    }
     documents {
-        integer id PK
-        text title
-        text source_name
-        text media_type
+        bigint id PK
         text content
-        text content_sha256 UK "identical text indexed once"
-        integer length "indexed tokens = |d| in BM25"
-        text created_at "ISO 8601 UTC"
+        bytea content_sha256 UK
+        int length "tokens, |d| in BM25"
+        bigint asset_id "set for units"
+        int start_ms
+        int end_ms
+        timestamptz deleted_at "tombstone"
     }
     terms {
-        integer id PK
-        text term UK "lower-cased, stemmed"
-        integer doc_freq "df in BM25, kept in step with postings"
+        bigint id PK
+        text term UK "stemmed"
+        text surface "readable form"
+        int doc_freq "compacted postings only"
     }
-    postings {
-        integer term_id PK,FK
-        integer doc_id PK,FK
-        integer tf "term frequency"
-    }
-    meta {
-        text key PK "schema_version, doc_count, total_length"
-        text value
+    postings_blocks {
+        bigint term_id PK
+        int block_no PK
+        bigint first_doc
+        bigint last_doc
+        int max_tf "score bound"
+        int min_len "score bound"
+        bytea payload "varint deltas + tfs"
     }
 ```
 
-The full DDL, with comments, is [`src/docsearch/schema.sql`](src/docsearch/schema.sql). `postings` is a `WITHOUT ROWID` table clustered on `(term_id, doc_id)`, so one term's postings list is a single contiguous range scan; the secondary index `postings_by_doc` lets deletion find a document's terms without scanning everything.
+DDL, with comments: [src/docsearch/engine/pg_schema.sql](src/docsearch/engine/pg_schema.sql). There are no foreign keys on the posting tables on purpose: they are written in bulk and rebuilt by the compactor.
 
-The legacy prototype's schema was never committed. From its SQL it was `files(id, file_src, file_text)` and `inverted_index(word_name, word_id JSON)`, with the postings list stored as a JSON array mutated on every token. That has no term frequencies (so no ranking), no document lengths, one commit per token, and rewrites the whole array to add one document.
+## Ingestion
 
-## Indexing flow
-
-1. `POST /v1/documents` — the middleware rejects a declared `Content-Length` over the limit before reading the body; the route then reads at most `max_upload_bytes + 1` bytes.
-2. `extract_text` picks a parser from the (sanitised) extension and returns text, or raises `UnsupportedMediaTypeError` (415) / `ExtractionError` (422).
-3. `Index.add` analyses the text into `{term: tf}` and `length`, then in **one `BEGIN IMMEDIATE` transaction**: de-duplicates by SHA-256 of the text, inserts the document, upserts terms, bumps `doc_freq`, inserts postings, updates the corpus counters. Any exception rolls the whole thing back (tested).
-
-Nothing from the upload touches the filesystem, and the original file is not kept: only extracted text and metadata are stored (ADR 0004).
-
-## Query flow and ranking
-
-`Index.search(q, mode, limit, offset)`:
-
-1. Analyse the query with the same function used for documents (so "running" finds "runs").
-2. Look up the query terms; in `all` (AND) mode, a term missing from the vocabulary short-circuits to zero results.
-3. For each term, read its postings joined with document lengths and accumulate BM25:
-
+```mermaid
+sequenceDiagram
+    participant U as Client
+    participant A as API
+    participant S as Object store
+    participant D as PostgreSQL
+    participant W as Worker
+    U->>A: POST /v1/documents (multipart)
+    A->>A: spool to disk in 1 MiB chunks, hash while reading
+    A->>S: put assets/ab/<sha256> (before the row: an orphan is harmless)
+    A->>D: INSERT asset ON CONFLICT (sha256) + INSERT job + NOTIFY
+    A-->>U: 202 {asset_id}
+    D-->>W: NOTIFY wakes an idle worker
+    W->>D: claim job (FOR UPDATE SKIP LOCKED, lease)
+    W->>S: get original
+    W->>W: extract / OCR / transcribe
+    W->>D: one txn: documents + delta postings (advisory write lock)
+    W->>D: asset=indexed, job=done (fenced by locked_by)
+    Note over D: compactor later folds delta rows into compressed blocks
 ```
-score(d, q) = Σ over t in q of  idf(t) · tf(t,d)·(k1+1) / ( tf(t,d) + k1·(1 − b + b·|d|/avgdl) )
-idf(t)      = ln( 1 + (N − df(t) + 0.5) / (df(t) + 0.5) )          k1 = 1.2, b = 0.75
-```
 
-   `N`, `avgdl` come from the `meta` counters (O(1)); `df` from `terms.doc_freq`.
-4. AND mode keeps documents that matched every term; the top `offset + limit` are selected with a heap (`O(M log k)` for `M` matching documents), ties broken by document id so results are deterministic.
-5. Only the returned page loads document text, to build a **snippet**: the window containing the densest cluster of query-term matches, returned as plain text plus highlight offsets. The server never emits HTML; the UI builds `<mark>` nodes with the DOM API.
+Delivery is *at least once*; every step is idempotent (content-addressed keys, `content_sha256` unique, state writes check the lease owner). Permanent errors (corrupt, encrypted, empty) go straight to `dead` with a readable message; transient ones retry with jittered exponential backoff. A scanned PDF starts as a `text` job and is *rerouted* to `ocr` when most pages have no text layer.
 
-The BM25 implementation is verified two ways in `tests/test_index.py`: a hand-computed score for a three-document corpus, and a brute-force reference scorer compared against the index on four queries.
+**Why a writer lock?** Ingest transactions take a per-schema advisory lock for their short database part (analysis happens before it, in parallel across workers). It makes document ids become visible in order, which lets the compactor append to the tail block instead of rewriting a term, and lets the length cache grow incrementally. It caps write throughput at one transaction at a time; batches amortise it.
 
-## Concurrency and durability
+## Search
 
-- SQLite in **WAL** mode: readers do not block the single writer. Writes use `BEGIN IMMEDIATE` with a 30 s busy timeout, so concurrent uploads queue instead of failing (a four-thread test checks that no document is lost).
-- Each operation opens its own short-lived connection, which keeps `Index` safe to share across the web server's thread pool. One extra idle connection is held for the index's lifetime, because SQLite checkpoints and deletes the WAL file whenever the *last* connection closes. Profiling showed `close()` taking 7 ms per write; keeping the WAL alive raised indexing from 67 to 219 docs/s on the same corpus (ADR 0005).
-- `doc_freq`, `doc_count` and `total_length` are updated in the same transaction as the postings, and a test asserts after mixed adds and deletes that every `doc_freq` equals the real postings count.
+1. **Parse** (`query.py`, total: it never raises on user input), **analyse** with the same analyzer as indexing (script-routed: English or Devanagari stemming).
+2. **Plain words** → the top-k engine: per term the compressed blocks are read, then either a *vectorised scan* or *block-max WAND / skip-driven intersection* runs, chosen by a cost rule (prune only if the rarest term is under 5% of documents *and* a scan would touch more than 300,000 postings; AND queries drive from the rarest list). Results equal exhaustive scoring bit for bit (differential tests against the SQLite engine).
+3. **Operators** → `engine/boolean.py` evaluates the tree exactly with sorted-array set algebra; phrases are the AND of their words, verified against stored text (capped at 1,000 best candidates, flagged `approximate` beyond that); filters run in SQL on the candidate ids.
+4. **Semantic / hybrid** → nearest passages from pgvector, fused with the keyword ranking by reciprocal rank fusion.
+5. The whole read runs in one `REPEATABLE READ` read-only transaction, so a compaction or ingest committing mid-query cannot hide or double-count a posting. Deleted documents are excluded by a cached tombstone set.
 
 ## Failure modes
 
-| Failure | Behaviour |
-|---------|-----------|
-| Unsupported / corrupt / encrypted file | 415 / 422 with a short message, nothing indexed |
-| File over limit | 413, either from `Content-Length` before reading or after a bounded read |
-| Zip bomb (.docx) | Total uncompressed size checked before parsing |
-| Scanned PDF with no text layer | 422 "no indexable text" |
-| Crash mid-write | Transaction never committed; WAL recovery on next open |
-| Storage unreachable | `/readyz` returns 503; `/healthz` stays 200 (process is alive) |
-| Duplicate upload | 200 with the existing document and `duplicate: true` |
+| Failure | Effect |
+|---|---|
+| worker crashes mid-job | lease expires, another worker repeats the job (idempotent); after `max_attempts` the job is dead-lettered and the asset marked failed |
+| worker was slow, lost its lease | its late `complete`/`fail` is refused (fencing); the new owner's result stands |
+| crash between object write and row insert | an orphaned object; collected by housekeeping after an hour |
+| upload deleted while being indexed | the worker notices (its asset update touches no row) and takes its documents back |
+| embedding or its job fails | the upload stays keyword-searchable; embed job state never changes asset status |
+| object store down | uploads return 503; jobs retry with backoff; `/readyz` reports it |
+| database restart | workers log and retry; the API returns 503 on affected routes |
+| analyzer changes after indexing | purge can miss postings (space, df drift); tombstones still guarantee deleted documents never appear |
+| no worker for a job kind | jobs wait; `docsearch_oldest_waiting_job_seconds{kind}` grows and should be alerted on |
 
-## Limits and what would change at scale
+## Scaling
 
-This design is honest about its ceiling:
+Measured: 300,000 documents on one laptop (README). Reasoned, **not built or measured**:
 
-- **One writer, one file.** Fine to roughly a million small documents on one machine; beyond that you shard by document and merge results, or move to a segment-based engine.
-- **Query cost grows with postings length.** A query of very common terms scores every posting (see the benchmark's "common terms (OR)" row). Production engines add block-max WAND / early termination and skip lists; the next step here would be to cap or sample postings for terms with very low idf.
-- **No phrase or proximity queries.** That needs positions in the postings (and a larger index).
-- **English only.** The analyzer is Snowball English; other languages need a per-document language and analyzer choice.
-- **Document text is stored in the same database** for snippets. For large corpora, store text in object storage and keep only the index here.
-- For real workloads, SQLite FTS5, PostgreSQL full-text search or OpenSearch would be the pragmatic choice — see ADR 0002 for why this project implements the index itself anyway.
+* **To millions of documents on one node:** the limits seen are query latency for common terms (linear in postings, about 160-230 ms at 300k), the single writer lock, and RAM for the length array (8 bytes per document) and tombstone set. Positions for phrases, a persistent tombstone bitmap and a pooled/partitioned write path are the next steps.
+* **To 100M:** shard `documents` and postings by document-id range across PostgreSQL nodes (each shard is a complete index; ids are range-allocated), fan a query out to all shards and merge top-k (BM25 needs global document frequencies, so each shard's `doc_freq`/counts are summed first: a cheap broadcast), keep the object store as is, and move the queue to a broker only if job rates exceed what `SKIP LOCKED` sustains (thousands per second). Read replicas serve search; the compactor runs on primaries. Beyond that, an engine with an FST dictionary and segment merging (Lucene-family) is the honest answer, and the benchmark against Postgres full-text search in the README is the baseline for deciding.
+
+## Testing strategy
+
+| Layer | How |
+|---|---|
+| Codec, search, query evaluation | property and differential tests: every strategy and mode against the SQLite exhaustive engine and brute-force set algebra |
+| PostgreSQL | the same corpora in every storage state (delta, compacted, mixed, after deletion and purge) |
+| Queue and pipeline | real database: exclusivity under concurrent claimers, lease expiry, fencing, retry/dead-letter, crash-after-index recovery, parallel workers |
+| OCR, speech, embeddings | real Tesseract, Whisper and embedding models inside the worker image, on rendered/synthesised inputs (accuracy claims limited accordingly) |
+| UI | component tests (Vitest, Testing Library) and a run against the live stack in a real browser |
+| Whole stack | `deploy/smoke.sh` against compose, and the CI `stack` job |
+
+Bugs found by running things rather than reading them are recorded in the ADRs and PROGRESS.md (PyAV 19 breaking faster-whisper, a bucket-creation race between processes, pruning slower than scanning on common terms, database-wide advisory locks, compaction slowing when the delta outgrew cache).

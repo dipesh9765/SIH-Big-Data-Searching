@@ -4,146 +4,144 @@
 ![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A small **full-text search engine** you can read in an afternoon. Upload PDF, DOCX, CSV, text or (with OCR) image files; docsearch extracts the text, builds an **inverted index** with corpus statistics, and answers queries with **BM25-ranked** results, highlighted snippets and pagination, through a typed HTTP API and a one-page UI.
+A search system for **documents, scanned pages, pictures and recordings**, in English, Hindi and Marathi. Upload a PDF, a photo of a page, a lecture video or a spreadsheet; workers extract the text (parsers, Tesseract OCR, Whisper speech-to-text), and an **inverted index of compressed postings blocks in PostgreSQL** answers keyword, phrase, boolean, filtered, typo-tolerant and semantic queries, with a hit in a recording playing from the second it was spoken.
 
-It started life as a Smart India Hackathon prototype (Node + EJS + Python subprocesses + MySQL) whose search never actually returned results. This is a ground-up rebuild: one language, one storage file, a documented schema, a ranking model that is tested against a reference implementation, and numbers measured on a reproducible benchmark.
+It started as a Smart India Hackathon prototype (Node + EJS + MySQL) whose search never returned a result. This is a ground-up rebuild: the index, ranking, query language, ingestion pipeline and UI are written here and tested against reference implementations. [PROGRESS.md](PROGRESS.md) lists what was verified and, as importantly, what was not.
 
 ```mermaid
 flowchart LR
-    U[Upload<br/>pdf docx csv txt png] --> E[Extract text<br/>limits + sanitised name]
-    E --> A[Analyse<br/>tokenise · stop words · stem]
-    A --> I[(Inverted index<br/>SQLite, WAL)]
-    Q[Query] --> A2[Same analyser]
-    A2 --> R[BM25 scoring<br/>top-k heap]
-    I --> R
-    R --> S[Snippets + highlight offsets]
+    UI[Web UI<br/>React + TypeScript] --> API
+    API[API<br/>FastAPI] -->|stream| OBJ[(Object store<br/>S3 API)]
+    API -->|asset + job, one transaction| PG
+    subgraph Workers["Workers (scale by adding processes)"]
+        W1[text<br/>pdf docx csv txt]
+        W2[ocr<br/>Tesseract eng hin mar]
+        W3[asr<br/>faster-whisper]
+        W4[embed<br/>multilingual text, CLIP]
+        WC[compactor]
+    end
+    PG[("PostgreSQL<br/>documents · terms<br/>postings blocks · delta<br/>job queue · pgvector")] <--> Workers
+    OBJ --> Workers
+    API -->|query| PG
 ```
+
+## What it does
+
+| | |
+|---|---|
+| **Inputs** | txt, md, csv, docx, pdf (text layer), images (png jpg tiff webp ...), scanned and mixed PDFs, audio (mp3 wav m4a flac ogg ...) and video (mp4 mkv webm mov avi) |
+| **Keyword search** | BM25, own inverted index: delta + varint compressed 128-posting blocks with per-block score bounds, block-max WAND and a vectorised scan chosen by a cost rule |
+| **Query language** | `"exact phrase"`, `AND` / `OR` / `NOT`, `-term`, `(groups)`, filters `type:` `ext:` `lang:` `before:` `after:` |
+| **Forgiving** | autocomplete, typo correction (`pg_trgm` + edit distance), "did you mean" |
+| **Hindi / Marathi** | Devanagari-aware tokenisation and stemming (the old tokenizer cut words at every vowel sign), Tesseract `hin`+`mar`, forced-language Whisper |
+| **Semantic** (opt-in) | multilingual passage embeddings in pgvector, hybrid ranking by reciprocal rank fusion; a Hindi question retrieves an English passage |
+| **Images** (opt-in) | find pictures by describing them (CLIP) |
+| **Recordings** | transcribed in 30-60 s units with timestamps; a hit has a "Play from 1:23" button; originals are served with HTTP `Range` |
+| **Operations** | asynchronous ingestion (202 + polling), leases, retries with backoff, dead letters, deletion with tombstones, Prometheus `/metrics`, API-key protection, signed media links |
 
 ## Quick start
 
+Needs Docker. Everything below runs from the repository root.
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile app up -d --build   # api, text worker, OCR worker, Postgres, object store
+./deploy/smoke.sh http://127.0.0.1:8080                                   # upload, index, search: "smoke test passed"
+```
+
+Open **http://127.0.0.1:8080** for the UI (API docs at `/docs`). Speech-to-text is its own worker: `--profile asr up -d worker-asr`. Semantic and image search: set `DOCSEARCH_SEMANTIC=1` on the API and workers and run an `embed` worker (`--kinds embed`); see [deploy/](deploy/).
+
+Without the UI, from the shell:
+
+```bash
+curl -F file=@report.pdf http://127.0.0.1:8080/v1/documents          # 202 {"asset_id": 7, "status": "queued"}
+curl http://127.0.0.1:8080/v1/assets/7                                # queued -> processing -> indexed
+curl 'http://127.0.0.1:8080/v1/search?q="climate+change"+type:pdf+-coal'
+curl 'http://127.0.0.1:8080/v1/suggest?q=glaci'
+```
+
+### Development setup
+
 ```bash
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt -e .
-uvicorn docsearch.api:create_app --factory          # http://127.0.0.1:8000  (API docs at /docs)
-```
-
-Or with Docker (includes Tesseract, so image uploads work):
-
-```bash
-docker build -t docsearch . && docker run -p 8000:8000 -v docsearch-data:/data docsearch
-```
-
-```bash
-curl -F file=@report.pdf http://localhost:8000/v1/documents
-curl 'http://localhost:8000/v1/search?q=quarterly+revenue&mode=all&limit=5'
-```
-
-Response (illustrative values):
-
-```jsonc
-{
-  "query": "quarterly revenue", "mode": "all", "total": 1, "took_ms": 1.4,
-  "results": [{
-    "document": {"id": 3, "title": "report.pdf", "source_name": "report.pdf",
-                 "media_type": "application/pdf", "tokens": 1840, "created_at": "2026-10-27T10:15:02+00:00"},
-    "score": 7.412,
-    "snippet": "… growth in quarterly revenue was driven by …",
-    "highlights": [[12, 21], [22, 29]]      // offsets into `snippet`; the server never returns HTML
-  }]
-}
-```
-
-## Scale-out mode (PostgreSQL + object store) — in development
-
-Branch `feature/scale-v2` adds a second deployment mode aimed at millions of documents: an inverted index of compressed postings blocks in PostgreSQL, originals in an S3-compatible store, and asynchronous ingestion by workers. The single-file SQLite mode above is unchanged.
-
-```bash
+pip install -r requirements-dev.txt -r requirements-ocr.txt -e .
 docker compose -f deploy/docker-compose.yml up -d postgres objects
-pip install -r requirements-dev.txt -e .
-uvicorn docsearch.service:create_app --factory --port 8080      # the API
-python -m docsearch.ingest.worker --compact-interval 20         # one or more workers
-curl -F file=@report.pdf http://127.0.0.1:8080/v1/documents     # 202 + asset id
-curl http://127.0.0.1:8080/v1/assets/1                          # queued / processing / indexed / failed
-curl 'http://127.0.0.1:8080/v1/search?q=glacier'
+make check                                           # ruff, strict mypy, pytest with a 90% coverage gate
+cd web && npm ci && npm run lint && npm test && npm run build
 ```
 
-Images and scanned PDFs are read by a separate OCR worker (Tesseract: English, Hindi, Marathi), which runs in Docker:
+The OCR, speech and embedding tests need the models, which live in the worker image; they are skipped on a bare machine and run in CI inside the image:
+`docker build -f deploy/Dockerfile.worker --target test -t docsearch-worker-test .` then `docker run --rm -v "$PWD:/app" -e DOCSEARCH_TEST_DSN=... docsearch-worker-test pytest -q --no-cov tests`.
 
-```bash
-docker compose -f deploy/docker-compose.yml --profile ocr up -d --build worker-ocr
-curl -F file=@scan.pdf http://127.0.0.1:8080/v1/documents       # a text worker hands it to the OCR pool
-```
-
-Measured on 300,000 synthetic documents and what is not yet built: see [PROGRESS.md](PROGRESS.md) and ADRs 0006-0010.
+The original single-file SQLite mode (`docsearch.api`, no external services) is still in the repository and unchanged; it is the oracle the PostgreSQL engine is tested against.
 
 ## API
 
-| Method & path | Purpose |
-|---------------|---------|
-| `POST /v1/documents` | Upload a file (`multipart`, field `file`, optional `?title=`). `201` new, `200` if identical text was already indexed |
-| `GET /v1/documents` · `GET /v1/documents/{id}` | List (newest first, paged) / fetch metadata |
-| `DELETE /v1/documents/{id}` | Remove a document and its postings |
-| `GET /v1/search?q=&mode=all\|any&limit=&offset=` | BM25 search; `all` = every term (AND), `any` = at least one (OR) |
-| `GET /v1/stats` | Corpus size, vocabulary, postings, accepted extensions, limits |
-| `GET /healthz` · `GET /readyz` | Liveness / readiness (storage check) |
-
-Errors are plain `{"detail": "..."}`: `413` too large, `415` unsupported type, `422` unreadable or empty document / bad parameters, `404` unknown id.
+| | |
+|---|---|
+| `POST /v1/documents` | store an upload and queue it: 202 with an asset id (200 if these exact bytes were uploaded before; a failed asset is re-queued) |
+| `GET /v1/assets/{id}` · `/v1/assets` | status (`queued` `processing` `indexed` `failed`), error, OCR confidence, duration, language |
+| `DELETE /v1/assets/{id}` · `/v1/documents/{id}` | leaves search at once; text and original are purged |
+| `GET /v1/search` | `q`, `mode=all|any`, `ranking=keyword|semantic|hybrid`, `limit`, `offset`; hits carry `snippet` + highlight offsets (never HTML) and `media` (asset, start/end ms) for recordings |
+| `GET /v1/search/images?q=` | pictures by description |
+| `GET /v1/suggest?q=` | autocomplete for the last word |
+| `GET /v1/assets/{id}/file` · `POST .../file-url` | the original, with `Range`; a signed short-lived URL for `<audio>`/`<video>`/`<img>` |
+| `GET /v1/stats` · `/metrics` · `/healthz` · `/readyz` | statistics, Prometheus metrics, probes |
 
 ## Configuration
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `DOCSEARCH_DB` | `data/docsearch.db` | SQLite file (created on first run) |
-| `DOCSEARCH_MAX_UPLOAD_MB` | `10` | Per-file upload limit |
-| `DOCSEARCH_MAX_RESULTS` | `50` | Cap on `limit` per search |
+Environment variables (see [deploy/.env.example](deploy/.env.example)); the defaults match the local compose stack and are for development only.
 
-See `.env.example`. There are no secrets in the code or repository.
+| Variable | Default | |
+|---|---|---|
+| `DOCSEARCH_DSN`, `DOCSEARCH_SCHEMA` | local Postgres, `public` | database and schema |
+| `DOCSEARCH_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_BUCKET` / `_SECURE` | local object store | any S3-compatible server |
+| `DOCSEARCH_API_KEY` | empty (open) | when set, every `/v1` route needs `Authorization: Bearer <key>` |
+| `DOCSEARCH_MAX_UPLOAD_MB` · `DOCSEARCH_MAX_MEDIA_MB` | 10 · 500 | documents/images · audio/video |
+| `DOCSEARCH_OCR_LANGS` · `DOCSEARCH_OCR_MAX_PAGES` | `eng+hin+mar` · 200 | |
+| `DOCSEARCH_ASR_MODEL` · `DOCSEARCH_ASR_LANGUAGE` · `DOCSEARCH_ASR_MAX_MINUTES` | `small` · auto · 240 | set the language (`hi`, `mr`) for Indian-language recordings |
+| `DOCSEARCH_SEMANTIC` | off | embeddings, semantic and image search |
+| `DOCSEARCH_WEB_DIR` | empty | serve a built UI at `/` |
 
-## How ranking works
+## How it works
 
-Each query term contributes `idf(t) · tf·(k1+1) / (tf + k1·(1 − b + b·|d|/avgdl))` with `k1 = 1.2`, `b = 0.75`, summed over terms. Document length and corpus statistics are stored and updated transactionally, so a query reads `N` and `avgdl` in O(1). The scorer is checked in `tests/test_index.py` against hand-computed values and against a brute-force reference on a small corpus. Details, the schema/ERD, concurrency model and failure modes are in [ARCHITECTURE.md](ARCHITECTURE.md).
+Documents are tokenised, stemmed and written as rows to a small *delta* table in one transaction; a compactor folds them into compressed 128-posting blocks (varint deltas, with the highest term frequency and shortest document length per block, so a score upper bound is known without decoding). Queries run in one `REPEATABLE READ` snapshot, so compaction can never hide or duplicate a posting. Rare terms are searched with block-max WAND; queries of common words use a vectorised scan, because measurement showed pruning loses there. Operators are evaluated exactly with set algebra; phrases are verified against the stored text. Design notes and the data model are in [ARCHITECTURE.md](ARCHITECTURE.md); each decision has an ADR.
 
-## Measured performance
+## Measured
 
-`python benchmarks/bench.py --docs 5000 --tokens 200` on a seeded Zipf-distributed synthetic corpus (5,000 documents × 200 tokens, 19,971 distinct terms, 701,969 postings, 26.7 MB database), single process, a Windows 11 laptop with an SSD, one transaction per uploaded document:
+On a Windows laptop (12 cores, 7.7 GB RAM), PostgreSQL 17 in Docker, **300,000 synthetic documents** (19.5M postings, Zipf-distributed words, ~80 tokens each), top-10, median of 9 runs, against PostgreSQL's built-in full-text search (GIN, `ts_rank_cd`):
 
-| Measure | Result |
-|---------|--------|
-| Indexing throughput | 80 docs/s (≈16k tokens/s) |
-| Query: two rare terms (AND) | p50 1.4 ms · p95 1.7 ms · p99 2.1 ms |
-| Query: one very common + one rare term (AND) | p50 24 ms · p95 29 ms · p99 33 ms |
-| Query: three most common terms (OR) | p50 65 ms · p95 81 ms · p99 90 ms |
-| Known-item recall@1 (query = a document's 3 rarest words) | 100% of 200 queries |
+| | docsearch | Postgres FTS |
+|---|---|---|
+| ingest (500-doc batches, includes analysis in Python) | 1,400 docs/s | |
+| compaction, run every 50k documents | 125k postings/s | |
+| index size without document text | 173 MB | 386 MB |
+| rare AND rare | 4.4 ms | 0.7 ms |
+| common AND rare | 25.6 ms | 2.3 ms |
+| common AND common | 162 ms | 508 ms |
+| 3 common words, OR | 231 ms | 2,229 ms |
+| common OR rare | 92 ms | 2,003 ms |
+| 6-term mixed OR | 67 ms | 3,367 ms |
 
-Read these honestly: the corpus is synthetic (word frequencies follow Zipf's law, but there is no real semantics), so the recall figure checks ranking sanity and not relevance quality. Latency grows with the length of the query terms' postings lists because every posting is scored; the common-term rows are the worst case (a top word appears in nearly every document). Production engines prune with skip lists and WAND/block-max; see "Limits" in ARCHITECTURE.md. The benchmark found and fixed one real cost: SQLite's WAL teardown on every connection close (ADR 0005), worth 3.3× indexing throughput at the time.
-
-## Development
-
-```bash
-pip install -r requirements-dev.txt -e .
-make check     # ruff + strict mypy + pytest with a 90% coverage gate
-make bench
-```
-
-82 tests (one needs the real Tesseract binary and runs in CI) cover the analyzer, BM25 maths, index consistency after mixed adds/deletes, rollback on failure, concurrent writers, every extractor (including corrupt, encrypted and zip-bomb inputs), the HTTP API (limits, status codes, injection-like input, security headers) and configuration. CI runs lint, types and tests on Python 3.12 and 3.13, a benchmark smoke test, and builds and smoke-tests the Docker image.
+Full-text search wins selective queries; this index wins queries made of common words, where full-text search must rank every match. Other measurements (in ADRs 0006, 0008, 0011, 0012, 0015): block-max pruning vs scanning, OCR cost per page, Whisper `base` vs `small`, cross-lingual retrieval on a small set. **Not measured:** 1,000,000 documents (this machine has 7.7 GB of RAM), concurrent load, real scans and natural speech, relevance on a real corpus.
 
 ## Design decisions
 
 | ADR | Decision |
-|-----|----------|
-| [0001](docs/adr/0001-sqlite-storage.md) | SQLite in WAL mode instead of a database server |
-| [0002](docs/adr/0002-own-bm25-index.md) | Implement the index and BM25 directly rather than calling SQLite FTS5 (and why you would not in production) |
-| [0003](docs/adr/0003-shared-analyzer.md) | One analyzer for documents and queries |
-| [0004](docs/adr/0004-store-text-not-files.md) | Keep extracted text, not the uploaded file |
-| [0005](docs/adr/0005-connection-per-operation-with-keepalive.md) | Connection per operation plus a keep-alive connection (measured) |
+|---|---|
+| [0001](docs/adr/0001-sqlite-storage.md)-[0005](docs/adr/0005-connection-per-operation-with-keepalive.md) | the single-node SQLite engine, own BM25, shared analyzer, text not files |
+| [0006](docs/adr/0006-compressed-postings-blocks.md) | compressed postings blocks, block-max WAND, and a cost rule choosing between pruning and scanning |
+| [0007](docs/adr/0007-typo-tolerance-and-autocomplete.md) | typo tolerance and autocomplete |
+| [0008](docs/adr/0008-postgres-postings-storage.md) | postings in PostgreSQL; why MongoDB was rejected; a rejected experiment (lazy block fetching) with numbers |
+| [0009](docs/adr/0009-postgres-job-queue.md) | the job queue in PostgreSQL |
+| [0010](docs/adr/0010-object-store-s3-api.md) | content-addressed originals in an S3-compatible store (SeaweedFS, since MinIO's images were withdrawn) |
+| [0011](docs/adr/0011-ocr-workers.md) · [0012](docs/adr/0012-speech-to-text.md) | OCR and speech-to-text pools |
+| [0013](docs/adr/0013-deletion-tombstones.md) | deletion: tombstone first, purge later |
+| [0014](docs/adr/0014-boolean-phrase-filter-queries.md) | query language, phrases by verification |
+| [0015](docs/adr/0015-semantic-and-image-search.md) | pgvector, multilingual embeddings, CLIP, rank fusion |
 
-## Limits and roadmap
+## Limits
 
-No phrase/proximity queries (needs positions in postings), English-only analysis, single writer, no authentication or rate limiting (see [SECURITY.md](SECURITY.md)), and no bulk-ingest endpoint (each upload is its own transaction). Next steps in order of value: bulk ingest in one transaction, postings pruning for very common terms, positional postings for phrase queries, and per-document language detection.
-
-## Project history
-
-The original prototype's code is in the git history before the `chore: remove the Node/EJS prototype` commit. Its audit — including why search never returned a result — is in [PROGRESS.md](PROGRESS.md).
+Hindi and Marathi speech recognition is weak (see ADR 0012); Marathi has no stemmer of its own; phrase search has no positional index (verified candidates, capped); the API key is a single shared secret and there is no per-user access control, rate limiting or TLS (put it behind a reverse proxy); the tombstone set grows with deletions; embeddings are one job per upload with no bulk backfill command; video is searched through its audio only; only a single PostgreSQL node is implemented (the sharding design is in ARCHITECTURE.md, not built). The CI workflow has not run on GitHub: it was written and checked locally only.
 
 ## License
 
