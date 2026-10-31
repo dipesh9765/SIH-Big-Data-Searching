@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# The HTTP service (uploads, search, UI). It never extracts text: workers do that.
+#   docker build -f deploy/Dockerfile.api -t docsearch-api .
+# Semantic search needs the embedding packages and models: build with --build-arg SEMANTIC=1.
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run build
+
+FROM python:3.13-slim AS base
+ARG SEMANTIC=0
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt requirements-semantic.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+ && if [ "$SEMANTIC" = "1" ]; then pip install --no-cache-dir -r requirements-semantic.txt \
+ && python -c "from fastembed import ImageEmbedding, TextEmbedding; c='/models/embed'; \
+TextEmbedding('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir=c); \
+TextEmbedding('Qdrant/clip-ViT-B-32-text', cache_dir=c)" \
+ && chmod -R a+rX /models; fi
+ENV DOCSEARCH_EMBED_CACHE=/models/embed HF_HUB_OFFLINE=1
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps . && useradd --system --uid 10001 --create-home app
+COPY --from=web /web/dist /app/web-dist
+ENV DOCSEARCH_WEB_DIR=/app/web-dist
+USER app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz')"
+CMD ["uvicorn", "docsearch.service:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

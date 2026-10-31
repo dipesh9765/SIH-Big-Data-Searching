@@ -58,6 +58,7 @@ class ServiceSettings:
     api_key: str = ""  # when set, every /v1 route requires it
     semantic: bool = False  # embeddings, semantic and image search (needs pgvector)
     embed_cache: str = ""  # where the embedding models are stored
+    web_dir: str = ""  # a built web UI to serve at / (empty: API only)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ServiceSettings:
@@ -83,6 +84,7 @@ class ServiceSettings:
             api_key=env.get("DOCSEARCH_API_KEY", defaults.api_key),
             semantic=env.get("DOCSEARCH_SEMANTIC", "").strip().lower() in ("1", "true", "yes"),
             embed_cache=env.get("DOCSEARCH_EMBED_CACHE", defaults.embed_cache),
+            web_dir=env.get("DOCSEARCH_WEB_DIR", defaults.web_dir),
             asr_model=env.get("DOCSEARCH_ASR_MODEL", defaults.asr_model),
             asr_model_dir=env.get("DOCSEARCH_ASR_MODEL_DIR", defaults.asr_model_dir),
             asr_language=env.get("DOCSEARCH_ASR_LANGUAGE", defaults.asr_language),

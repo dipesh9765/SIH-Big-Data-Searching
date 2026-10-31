@@ -353,6 +353,8 @@ def test_metrics_endpoint_reports_requests_queue_and_documents(rig: Rig) -> None
     )  # the template, not "/v1/assets/999"
     assert 'docsearch_jobs{state="queued"} 1' in text
     assert 'docsearch_assets{status="queued"} 1' in text
+    assert 'docsearch_oldest_waiting_job_seconds{kind="text"}' in text
+    assert 'docsearch_oldest_waiting_job_seconds{kind="asr"} 0' in text  # nothing waiting for it
     rig.drain()
     after = rig.client.get("/metrics").text
     assert "docsearch_documents 1" in after

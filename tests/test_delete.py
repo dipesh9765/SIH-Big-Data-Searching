@@ -300,3 +300,40 @@ def test_delete_endpoints(secured: tuple[TestClient, PgIndex, MemoryStore]) -> N
     assert client.delete(f"/v1/assets/{asset}", headers=auth).status_code == 204
     assert client.delete(f"/v1/assets/{asset}", headers=auth).status_code == 404
     assert client.get(f"/v1/assets/{asset}/file", headers=auth).status_code == 404
+
+
+def test_signed_file_links_work_for_media_elements_without_the_key(
+    secured: tuple[TestClient, PgIndex, MemoryStore],
+) -> None:
+    client, _pg, _store = secured
+    auth = {"Authorization": "Bearer s3cret-key"}
+    asset = client.post(
+        "/v1/documents", files={"file": ("a.mp3", b"audio" * 50)}, headers=auth
+    ).json()["asset_id"]
+    path = f"/v1/assets/{asset}/file"
+    assert client.get(path).status_code == 401
+    assert (
+        client.post(f"{path[:-5]}/file-url").status_code == 401
+    )  # asking for a link needs the key
+    link = client.post(f"/v1/assets/{asset}/file-url", headers=auth).json()["url"]
+    assert link.startswith(path + "?token=")
+    assert client.get(link).content == b"audio" * 50  # no Authorization header
+    assert client.get(link, headers={"Range": "bytes=0-4"}).status_code == 206
+    assert client.get(link.replace("token=", "token=0")).status_code == 401  # tampered
+    other = client.post(
+        "/v1/documents", files={"file": ("b.mp3", b"other" * 50)}, headers=auth
+    ).json()["asset_id"]
+    assert client.get(f"/v1/assets/{other}/file?token={link.split('token=')[1]}").status_code == 401
+    assert client.post("/v1/assets/999999/file-url", headers=auth).status_code == 404
+
+
+def test_an_expired_link_is_refused() -> None:
+    from docsearch.service import sign_file_token, valid_file_token
+
+    past = 1_000
+    token = sign_file_token("k", 7, past)
+    assert not valid_file_token("k", 7, token, now=2_000)
+    assert valid_file_token("k", 7, token, now=999)
+    assert not valid_file_token("other", 7, token, now=999)
+    assert not valid_file_token("k", 8, token, now=999)
+    assert not valid_file_token("k", 7, "garbage", now=0)

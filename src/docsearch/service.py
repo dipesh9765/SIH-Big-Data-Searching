@@ -17,8 +17,10 @@ do the indexing; this process never extracts text.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -38,6 +40,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from docsearch import __version__
@@ -189,6 +192,25 @@ def _asset(row: tuple[object, ...]) -> AssetOut:
 
 
 FILE_CHUNK = 1024 * 1024
+FILE_URL_SECONDS = 600
+_FILE_PATH = re.compile(r"^/v1/assets/(\d+)/file$")
+
+
+def sign_file_token(secret: str, asset_id: int, expires: int) -> str:
+    """A time-limited token that lets a media element fetch one asset's file.
+
+    `<audio>` and `<video>` cannot send an Authorization header, so with an API key set the UI asks
+    (authenticated) for a short-lived URL instead of putting the key in a page URL."""
+    mac = hmac.new(secret.encode(), f"file:{asset_id}:{expires}".encode(), hashlib.sha256)
+    return f"{expires}.{mac.hexdigest()}"
+
+
+def valid_file_token(secret: str, asset_id: int, token: str, now: float) -> bool:
+    expires_text, _, _ = token.partition(".")
+    if not expires_text.isdigit() or int(expires_text) < now:
+        return False
+    expected = sign_file_token(secret, asset_id, int(expires_text))
+    return hmac.compare_digest(token.encode(), expected.encode())
 
 
 def _parse_range(  # noqa: PLR0911 - one return per header shape
@@ -274,6 +296,13 @@ def create_service_app(
                 assets: dict[str, int] = dict(
                     conn.execute("SELECT status, count(*) FROM assets GROUP BY status")
                 )
+                waiting: dict[str, float] = {
+                    kind: float(age)
+                    for kind, age in conn.execute(
+                        "SELECT kind, extract(epoch FROM now() - min(run_after)) FROM ingest_jobs"
+                        " WHERE state = 'queued' AND run_after <= now() GROUP BY kind"
+                    )
+                }
         except Exception:  # a scrape must not fail because the database is briefly unavailable
             log.exception("could not collect gauges")
             yield "docsearch_up", {}, 0.0
@@ -288,6 +317,10 @@ def create_service_app(
             yield "docsearch_jobs", {"state": state}, value
         for status in ("queued", "processing", "indexed", "failed"):
             yield "docsearch_assets", {"status": status}, int(assets.get(status, 0))
+        # Alert on this: a job kind with no worker (OCR, speech, embeddings) shows up as an age that
+        # only grows.
+        for kind in ("text", "ocr", "asr", "embed"):
+            yield "docsearch_oldest_waiting_job_seconds", {"kind": kind}, waiting.get(kind, 0.0)
 
     metrics.gauge_source(gauges)
 
@@ -306,6 +339,14 @@ def create_service_app(
         readiness, metrics and the docs page are left open for probes and scrapers."""
         if not settings.api_key or not request.url.path.startswith("/v1"):
             return
+        match = _FILE_PATH.match(request.url.path)
+        token = request.query_params.get("token", "")
+        if (
+            match
+            and token
+            and valid_file_token(settings.api_key, int(match.group(1)), token, time.time())
+        ):
+            return  # a signed, expiring link for exactly this file
         supplied = x_api_key or (
             authorization[7:] if authorization and authorization[:7].lower() == "bearer " else ""
         )
@@ -382,6 +423,20 @@ def create_service_app(
         if row is None:
             raise error(404, "asset not found")
         return _asset(row)
+
+    @app.post("/v1/assets/{asset_id}/file-url")
+    def file_url(asset_id: int) -> dict[str, str]:
+        """A URL for the original file that a media element can load: signed and short-lived when
+        an API key is configured, the plain path otherwise."""
+        with index.connection() as conn:
+            found = conn.execute("SELECT 1 FROM assets WHERE id = %s", (asset_id,)).fetchone()
+        if found is None:
+            raise error(404, "asset not found")
+        path = f"/v1/assets/{asset_id}/file"
+        if not settings.api_key:
+            return {"url": path}
+        expires = int(time.time()) + FILE_URL_SECONDS
+        return {"url": f"{path}?token={sign_file_token(settings.api_key, asset_id, expires)}"}
 
     @app.get("/v1/assets/{asset_id}/file")
     def get_asset_file(
@@ -589,6 +644,9 @@ def create_service_app(
             version=__version__,
         )
 
+    if settings.web_dir and Path(settings.web_dir).is_dir():
+        # Mounted last, so every API route above takes precedence over the static files.
+        app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")
     return app
 
 
