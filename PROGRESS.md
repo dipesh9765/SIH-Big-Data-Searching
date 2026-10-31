@@ -85,29 +85,40 @@ The MySQL `root` password in `app.js` appeared in 10 commits. The database no lo
 - [ ] Pushed (blocked, see above)
 
 
-## Scale-out rebuild (branch `feature/scale-v2`, started 2026-10-29)
+## Scale-out rebuild (branch `feature/scale-v2`, 2026-10-29 to 2026-11-01)
 
-Goal: millions of documents, many media types, inverted index in a database. Plan: Postgres (metadata, own compressed postings, pgvector), MinIO for files, FastAPI + workers, React UI. Phases and decisions are in the plan file; ADRs 0006 and 0007 record what is built.
+Goal: millions of documents of many media types, with the inverted index in a database. Stack: PostgreSQL 17 (+ pgvector, pg_trgm) for metadata, own compressed postings and the job queue; an S3-compatible store for originals; FastAPI + worker processes; React UI. MongoDB was rejected (ADR 0008).
 
-Done and tested (no Docker needed):
-- `engine/codec.py`, `engine/search.py`, `engine/memory.py`: compressed postings blocks, block-max WAND, vectorised scan, cost-based strategy choice. Differential tests against the SQLite index (ADR 0006).
-- `analysis.py`: Hindi/Marathi tokenisation fix (Python's `\w` split Devanagari words at every vowel sign), script-routed stemming, stop words.
-- `query.py`: total parser for phrases, AND/OR/NOT, `-term`, grouping, filters; bounded for hostile input.
-- `engine/terms.py`: prefix completion and typo-tolerant lookup (ADR 0007).
+### Delivered (all committed locally, nothing pushed)
 
-Blocked / not started:
-- (Resolved) Docker Desktop is now installed; Postgres 17 + pgvector runs from `deploy/docker-compose.yml`.
-- **RAM: 7.7 GB total (about 1 GB free during work).** A 1M-document Postgres benchmark alongside MinIO and workers will be tight; plan for a smaller corpus first (200-300k) and say so, or run on a bigger machine.
-- Positions (phrase matching), storage layer, ingestion workers, media (OCR/Whisper/embeddings), React UI, hardening and docs.
+| Area | What | ADR |
+|---|---|---|
+| Index engine | delta + varint postings blocks with score bounds; block-max WAND, vectorised scan, cost rule; differential tests vs the SQLite engine | 0006 |
+| PostgreSQL | delta table + compactor, snapshot reads, pool, per-schema advisory locks | 0008 |
+| Ingestion | content-addressed object store, Postgres job queue (leases, fencing, backoff, dead letters, NOTIFY), streaming uploads, range file serving, signed media links, housekeeping | 0009, 0010 |
+| OCR | Tesseract eng+hin+mar, scanned/mixed PDFs, rerouting from the text pool, confidence | 0011 |
+| Speech | faster-whisper `small`, timestamped units, hits that play from the moment | 0012 |
+| Deletion | tombstones + purge, asset deletion, API-key auth | 0013 |
+| Queries | phrases, AND/OR/NOT, filters (exact set algebra), autocomplete, typo correction, did-you-mean, Devanagari analysis | 0007, 0014 |
+| Semantic | multilingual passage embeddings, CLIP image search, hybrid RRF, opt-in | 0015 |
+| UI and ops | React + TS UI, `/metrics`, compose stack, API and worker images, CI workflow, smoke script | - |
 
-Postgres layer (done, tested; ADR 0008): `engine/pg.py` + `pg_schema.sql` (delta table, compactor, snapshot reads, pool); 16 tests compare it with the SQLite reference in every storage state. 300k-document benchmark recorded in the ADR (ingest 1.4k docs/s; compaction must run continuously; faster than Postgres FTS on common-term queries, slower on rare-term queries).
+### Verified
+- **Host:** 374 tests passed, 21 skipped (the ones needing the models), 91.5% coverage against a 90% gate; ruff and strict mypy clean; PostgreSQL-backed tests run against the compose database.
+- **Container (real models):** the whole suite inside the worker image with real Tesseract, faster-whisper `small` and the multilingual/CLIP models: 394 passed, 1 skipped (the S3 test cannot reach the host store from the container).
+- **Web:** Vitest (36 tests), strict TypeScript, ESLint, production build 234 KB (74 KB gzip); driven in a real browser against the live service (autocomplete, highlighted hits, Hindi inflection, phrase, OR, NOT, filters, did-you-mean, library).
+- **Whole stack:** `docker compose --profile app up` then `deploy/smoke.sh` (upload English and Hindi text, index, search) and OCR of images and a scanned PDF through the containerised workers.
+- **Benchmark:** 300,000 synthetic documents against Postgres full-text search (README).
+- **Bugs found only by running things**, all fixed and recorded: PyAV 19 vs faster-whisper; bucket-creation race between processes; database-wide advisory locks; pruning slower than scanning; compaction slowdown once the backlog outgrew cache; Devanagari words cut at vowel signs; a short PDF mistaken for a scan; an unbounded test loop that hung the suite.
 
-Still open: lazy per-block fetching, deletion, MinIO + ingestion workers and job queue, phrase positions, API wiring (the FastAPI app still uses the SQLite index), OCR / speech / embeddings, React UI, CI for the compose services, a 1M-document run on a bigger machine.
-
-Ingestion (done, tested; ADRs 0009, 0010): S3-compatible object store (SeaweedFS in compose; MinIO images are no longer pullable), content-addressed keys, Postgres job queue with leases/fencing/backoff/dead letters, batch worker with optional background compactor, and an HTTP service (`docsearch.service`: 202 upload, asset status, search, stats, readiness). 25 queue/pipeline tests and 11 service tests against real Postgres; a run with real `uvicorn` and CLI worker processes indexed Hindi, PDF, DOCX, CSV and text files and reported a corrupt PDF with a readable reason.
-
-Still open: OCR / speech / embeddings workers (job kinds exist), phrase positions, deletion, streaming/pre-signed uploads for large media, `/metrics`, the React UI (the old static page targets the SQLite API), CI jobs that start Postgres and the object store, Docker images for api/worker, a 1M-document run on a bigger machine.
-
-OCR (done, tested; ADR 0011): `ocr.py` (images, multi-frame TIFF, scanned and mixed PDFs, limits, confidence), `ocr` job kind with reroute from text workers, `deploy/Dockerfile.worker` (Tesseract eng+hin+mar) and compose service `worker-ocr`. 18 OCR tests and the OCR pipeline tests run against real Tesseract in the container; a real-process run indexed English and Hindi images and scanned/mixed PDFs. Accuracy figures are for software-rendered text only; no real scans were available.
-
-Still open: audio/video (speech-to-text) and image-content search (captions/embeddings), semantic search, phrase positions, deletion, streaming uploads, `/metrics`, the React UI, CI jobs for the compose services and the OCR image, API image.
+### Not verified / open
+- **CI has never run on GitHub.** The workflow (including the `containers` job that builds the 4 GB test image and the `stack` job) was written and its pieces were run locally, not as a whole.
+- **No 1,000,000-document run**: this machine has 7.7 GB of RAM (Docker gets about 4 GB). Latency for common-term queries is linear in postings (about 160-230 ms at 300k).
+- **Accuracy numbers are from synthetic inputs**: rendered text for OCR (95%+ confidence, clean fonts), eSpeak speech for Whisper, 8 passages and 5 pictures for the embeddings. Real scans, natural speech and a real relevance judgement set were not available. **Hindi and Marathi speech recognition was poor** (language detection fails; forced language gives partly right Devanagari).
+- Marathi has no stemmer of its own (Hindi rules are applied).
+- Phrase search verifies candidates against text (capped at 1,000); there is no positional index.
+- Embedding backfill for existing documents has no command; video is searched through its audio only.
+- Single shared API key; no per-user access, rate limiting or TLS. Tombstones are never removed.
+- Sharding for 100M documents is designed in ARCHITECTURE.md, not implemented.
+- The SIH GitHub repository still holds the old history with the dead MySQL password (a force-push was refused by branch protection); that needs the owner.
+- `npm audit`: 11 moderate advisories in development tooling, not addressed.
