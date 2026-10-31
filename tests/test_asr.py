@@ -320,11 +320,11 @@ def test_end_to_end_spoken_words_are_searchable_with_a_position(
     index: PgIndex, tmp_path: Path, real_config: AsrConfig
 ) -> None:
     store = MemoryStore()
-    wav = synth(tmp_path, "Satellite imagery shows coral bleaching across the reef.")
-    sub = submit(index, store, name="reef.wav", data=wav.read_bytes())
+    wav = synth(tmp_path, "Earthquake early warning systems saved many lives.")
+    sub = submit(index, store, name="warning.wav", data=wav.read_bytes())
     worker = Worker(index, store, worker_id="asr-1", kinds=("asr",), batch_size=1, asr=real_config)
     assert worker.run_once().indexed == 1
-    hits = index.search("coral").hits
+    hits = index.search("earthquake").hits
     assert len(hits) == 1
     media = hits[0].media
     assert media is not None

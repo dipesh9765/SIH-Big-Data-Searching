@@ -1,3 +1,8 @@
-# Optional speech-to-text for audio and video uploads (CPU, int8). Versions are pinned after the first
-# image build; see deploy/Dockerfile.worker, which also downloads the model into the image.
-faster-whisper>=1.1
+# Speech-to-text for audio and video uploads (CPU, int8). Installed in the worker image, which also
+# downloads the Whisper model at build time (deploy/Dockerfile.worker).
+# av is pinned below 19: faster-whisper 1.2.1 calls av.open(metadata_errors=...), which PyAV 19
+# removed (found by running the real-speech tests).
+faster-whisper==1.2.1
+av==18.1.0
+ctranslate2==4.8.4
+onnxruntime==1.31.1

@@ -290,3 +290,51 @@ def test_streaming_upload_stops_reading_at_the_limit(rig: Rig) -> None:
     with pytest.raises(TooLargeError):
         submit_stream(rig.index, rig.store, name="a.mp3", stream=stream, max_bytes=1 * 2**20)
     assert Counting.reads <= 3  # 1 MiB chunks: stopped just past the limit, not after 10 MiB
+
+
+def test_search_hits_in_a_recording_point_at_the_moment_and_the_file(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from docsearch.asr import Transcript
+    from docsearch.extract import Unit
+
+    audio = b"pretend recording " * 30
+    asset = rig.upload("keynote.mp3", audio, title="Keynote").json()["asset_id"]
+    monkeypatch.setattr(
+        "docsearch.ingest.pipeline.transcribe",
+        lambda *_a, **_k: Transcript(
+            [
+                Unit("welcome everyone to the glacier workshop", 0, 20_000),
+                Unit("now the volcano session begins", 20_000, 45_500),
+            ],
+            "en",
+            0.97,
+            45_500,
+        ),
+    )
+    Worker(rig.index, rig.store, worker_id="asr", kinds=("asr",), batch_size=1).run_once()
+    info = rig.client.get(f"/v1/assets/{asset}").json()
+    assert (info["status"], info["units"], info["duration_ms"], info["language"]) == (
+        "indexed",
+        2,
+        45_500,
+        "en",
+    )
+    hit = rig.client.get("/v1/search?q=volcano").json()["results"][0]
+    assert hit["document"]["title"] == "Keynote"
+    assert hit["media"] == {
+        "asset_id": asset,
+        "kind": "transcript",
+        "start_ms": 20_000,
+        "end_ms": 45_500,
+        "file_url": f"/v1/assets/{asset}/file",
+    }
+    assert rig.client.get(hit["media"]["file_url"]).content == audio
+    plain = rig.upload("notes.txt", b"volcano notes on paper").json()["asset_id"]
+    Worker(rig.index, rig.store, worker_id="t").run_once()
+    texts = list(rig.client.get("/v1/search?q=volcano&mode=any").json()["results"])
+    assert {bool(r["media"]) for r in texts} == {
+        True,
+        False,
+    }  # recordings link out; documents do not
+    assert plain

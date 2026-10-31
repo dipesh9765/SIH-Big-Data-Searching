@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt -r re
 ARG ASR_MODEL=base
 ENV DOCSEARCH_ASR_MODEL=${ASR_MODEL} DOCSEARCH_ASR_MODEL_DIR=/models
 RUN python -c "from faster_whisper import WhisperModel; import os; WhisperModel(os.environ['DOCSEARCH_ASR_MODEL'], device='cpu', compute_type='int8', download_root='/models')"  && chmod -R a+rX /models
+ENV HF_HUB_OFFLINE=1
 
 FROM base AS worker
 COPY pyproject.toml README.md ./
@@ -30,8 +31,10 @@ CMD ["--kinds", "ocr", "--compact-interval", "0"]
 
 # Test image: fonts to render sample pages, dev tools. Source is mounted at run time (-v .:/app).
 FROM base AS test
+# espeak-ng and ffmpeg synthesise speech and build sample audio/video for the tests.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends fonts-dejavu-core fonts-lohit-deva \
+ && apt-get install -y --no-install-recommends \
+      fonts-dejavu-core fonts-lohit-deva espeak-ng ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
