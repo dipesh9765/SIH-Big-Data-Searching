@@ -123,6 +123,22 @@ def tokenize(text: str) -> list[Token]:
     return tokens
 
 
+def script_of(text: str) -> str:
+    """A coarse script tag for filtering: "deva" (Devanagari: Hindi, Marathi, ...), "latn", "mixed",
+    or "" when there are no letters. It names the script, not the language."""
+    # Combining marks (vowel signs) belong to the letters they modify, so count them too.
+    letters = [c for c in text if c.isalpha() or unicodedata.category(c).startswith("M")]
+    if not letters:
+        return ""
+    devanagari = sum("\u0900" <= c <= "\u097f" for c in letters)
+    latin = sum(c.isascii() for c in letters)
+    if devanagari / len(letters) > 0.6:
+        return "deva"
+    if latin / len(letters) > 0.6:
+        return "latn"
+    return "mixed"
+
+
 def term_frequencies(text: str) -> tuple[Counter[str], int]:
     """Return ({term: count}, total indexed tokens) for `text`."""
     counts = Counter(token.term for token in tokenize(text))

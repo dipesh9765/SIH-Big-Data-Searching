@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from docsearch.analysis import script_of
 from docsearch.asr import AsrConfig, transcribe
 from docsearch.engine.pg import NewDocument, PgIndex
 from docsearch.extract import (
@@ -404,6 +405,7 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
                     source_name,
                     extracted.media_type,
                     unit.text,
+                    lang=extracted.language or "",
                     asset_id=job.asset_id,
                     start_ms=unit.start_ms,
                     end_ms=unit.end_ms,
@@ -413,7 +415,15 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
                 for unit in extracted.units
             )
         else:
-            documents.append(NewDocument(title, source_name, extracted.media_type, extracted.text))
+            documents.append(
+                NewDocument(
+                    title,
+                    source_name,
+                    extracted.media_type,
+                    extracted.text,
+                    lang=script_of(extracted.text),
+                )
+            )
         spans.append((begin, len(documents)))
     try:
         added = index.add_many_skipping_empty(documents)

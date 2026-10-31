@@ -43,7 +43,7 @@ from pydantic import BaseModel
 from docsearch import __version__
 from docsearch.api import DocumentOut
 from docsearch.config import ServiceSettings
-from docsearch.engine.pg import PgHit, PgIndex
+from docsearch.engine.pg import InvalidFilterError, PgHit, PgIndex
 from docsearch.extract import (
     SPEECH_MEDIA_TYPES,
     UnsupportedMediaTypeError,
@@ -135,6 +135,7 @@ class SearchOut(BaseModel):
     query: str
     mode: Literal["all", "any"]
     total: int | None  # None: pruning skipped matches, so the exact count is not known
+    approximate: bool  # a phrase had more candidates than the engine verified
     strategy: str
     took_ms: float
     results: list[HitOut]
@@ -446,14 +447,18 @@ def create_service_app(
     ) -> SearchOut:
         limit = min(limit, settings.max_results)
         started = time.perf_counter()
-        result = index.search(q, mode=mode, limit=offset + limit, exact_total=exact_total)
+        try:
+            result = index.query(q, mode=mode, limit=limit, offset=offset, exact_total=exact_total)
+        except InvalidFilterError as exc:
+            raise error(422, str(exc)) from exc
         return SearchOut(
             query=q,
             mode=mode,
             total=result.total,
+            approximate=result.approximate,
             strategy=result.strategy,
             took_ms=round((time.perf_counter() - started) * 1000, 2),
-            results=[HitOut.of(h) for h in result.hits[offset:]],
+            results=[HitOut.of(h) for h in result.hits],
         )
 
     @app.get("/v1/stats", response_model=StatsOut)

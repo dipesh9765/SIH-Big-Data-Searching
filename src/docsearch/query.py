@@ -21,7 +21,22 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from docsearch.analysis import query_terms
+from docsearch.analysis import query_terms, tokenize
+
+
+def text_contains_phrase(text: str, terms: tuple[str, ...]) -> bool:
+    """True if the analysed `terms` occur consecutively in `text` (stop words are not analysed
+    tokens, so they neither help nor break a match)."""
+    tokens = [t.term for t in tokenize(text)]
+    width = len(terms)
+    if width == 0 or len(tokens) < width:
+        return False
+    first = terms[0]
+    return any(
+        tokens[i] == first and tuple(tokens[i : i + width]) == terms
+        for i in range(len(tokens) - width + 1)
+    )
+
 
 FILTER_FIELDS = frozenset({"type", "lang", "ext", "before", "after"})
 MAX_QUERY_CHARS = 1000  # longer input is cut: nothing useful is 1000+ characters of query

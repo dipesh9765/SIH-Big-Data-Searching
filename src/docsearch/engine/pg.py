@@ -24,6 +24,7 @@ import threading
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from datetime import date
 from importlib import resources
 
 import numpy as np
@@ -33,9 +34,22 @@ from psycopg import IsolationLevel
 from psycopg_pool import ConnectionPool
 
 from docsearch.analysis import query_terms, term_frequencies
+from docsearch.engine.boolean import Evaluator, Matches, top_k
 from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, encode_block, iter_postings
-from docsearch.engine.search import Mode, Outcome, Pruning, search
+from docsearch.engine.search import Mode, Outcome, Pruning, ScoredDoc, SearchStats, search
 from docsearch.index import Document, EmptyDocumentError, make_snippet
+from docsearch.query import (
+    AAnd,
+    AFilter,
+    ANode,
+    ANot,
+    AOr,
+    APhrase,
+    ATerm,
+    analyse,
+    parse,
+    text_contains_phrase,
+)
 
 # Advisory locks are (class, hash of the schema name) so indexes in different schemas of one
 # database never block each other.
@@ -91,6 +105,7 @@ class PgSearchResult:
     total: int | None  # None when pruning skipped matches, so the count is unknown
     hits: list[PgHit]
     strategy: str
+    approximate: bool = False  # a phrase had more candidates than were verified
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +203,76 @@ def _merge(
         return blocks + build_blocks(delta, lengths)  # the normal case: delta is newer
     merged = sorted([*iter_postings(blocks), *delta])  # out-of-order commit: rare, slow path
     return build_blocks(merged, lengths)
+
+
+class InvalidFilterError(ValueError):
+    """A query filter has a value that cannot be used (for example a malformed date)."""
+
+
+def _split_filters(tree: ANode) -> tuple[list[AFilter], ANode | None]:
+    """Separate top-level filters from the rest. Filters only apply at the top level of an AND."""
+    if isinstance(tree, AFilter):
+        return [tree], None
+    if isinstance(tree, AAnd):
+        filters = [c for c in tree.children if isinstance(c, AFilter)]
+        rest = [c for c in tree.children if not isinstance(c, AFilter)]
+        if not rest:
+            return filters, None
+        core: ANode = rest[0] if len(rest) == 1 else AAnd(tuple(rest))
+        return filters, core
+    return [], tree
+
+
+def _plain_terms(node: ANode) -> list[str] | None:
+    """The terms of a query that is just words (a term or an AND of terms), else None."""
+    if isinstance(node, ATerm):
+        return [node.term]
+    if isinstance(node, AAnd) and all(isinstance(c, ATerm) for c in node.children):
+        return [c.term for c in node.children if isinstance(c, ATerm)]
+    return None
+
+
+def _all_terms(node: ANode) -> set[str]:
+    """Every term the evaluator will need blocks for, including negated ones."""
+    if isinstance(node, ATerm):
+        return {node.term}
+    if isinstance(node, APhrase):
+        return set(node.terms)
+    if isinstance(node, ANot):
+        return _all_terms(node.child)
+    if isinstance(node, (AAnd, AOr)):
+        return set().union(*(_all_terms(c) for c in node.children))
+    return set()
+
+
+def _positive_terms(node: ANode) -> set[str]:
+    """Terms worth highlighting in snippets: everything except what the query excludes."""
+    if isinstance(node, ANot):
+        return set()
+    if isinstance(node, (AAnd, AOr)):
+        return set().union(*(_positive_terms(c) for c in node.children))
+    return _all_terms(node)
+
+
+def _like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _filter_clause(item: AFilter) -> tuple[str, list[object]]:
+    value = item.value.strip().lower()
+    if item.field == "type":
+        return "media_type ILIKE %s", [f"%{_like(value)}%"]
+    if item.field == "ext":
+        return "lower(source_name) LIKE %s", [f"%.{_like(value.lstrip('.'))}"]
+    if item.field == "lang":
+        return "lang = %s", [value]
+    try:
+        day = date.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidFilterError(f"{item.field}: expects a date like 2025-01-31") from exc
+    if item.field == "before":
+        return "created_at < %s::date", [day]
+    return "created_at >= %s::date", [day]  # after:
 
 
 class PgIndex:
@@ -503,6 +588,107 @@ class PgIndex:
             )
             hits = self._hits(conn, outcome, set(terms))
         return PgSearchResult(outcome.total, hits, outcome.stats.strategy)
+
+    def query(
+        self,
+        text: str,
+        *,
+        mode: Mode = "all",
+        limit: int = 10,
+        offset: int = 0,
+        exact_total: bool = False,
+    ) -> PgSearchResult:
+        """Search with the query language: "phrases", AND / OR / NOT, -term, (groups), and the
+        filters type:, ext:, lang:, before:, after:. Plain words behave exactly as `search` does
+        (`mode` applies); anything with operators is evaluated exactly by `engine.boolean`.
+
+        Raises `InvalidFilterError` for a filter with an unusable value (such as a bad date).
+        """
+        tree = analyse(parse(text))
+        if tree is None:
+            return PgSearchResult(0, [], "")
+        filters, core = _split_filters(tree)
+        if core is None:
+            return PgSearchResult(0, [], "")  # filters alone select nothing: a term is required
+        plain = _plain_terms(core)
+        if plain is not None and not filters:
+            found = self._search_terms(
+                plain, mode=mode, limit=limit + offset, exact_total=exact_total
+            )
+            return PgSearchResult(
+                found.total, found.hits[offset:], found.strategy, found.approximate
+            )
+        return self._boolean(core, filters, limit + offset, offset)
+
+    def _search_terms(
+        self, terms: list[str], *, mode: Mode, limit: int, exact_total: bool
+    ) -> PgSearchResult:
+        with self._read() as conn:
+            snapshot = self._snapshot(conn, terms)
+            if snapshot.doc_count == 0:
+                return PgSearchResult(0, [], "")
+            outcome = search(snapshot, terms, mode=mode, k=limit, exact_total=exact_total)
+            hits = self._hits(conn, outcome, set(terms))
+        return PgSearchResult(outcome.total, hits, outcome.stats.strategy)
+
+    def _boolean(
+        self, core: ANode, filters: list[AFilter], need: int, offset: int
+    ) -> PgSearchResult:
+        for item in filters:
+            _filter_clause(item)  # validate values before doing any work
+        terms = sorted(_all_terms(core))
+        with self._read() as conn:
+            snapshot = self._snapshot(conn, terms)
+            if snapshot.doc_count == 0:
+                return PgSearchResult(0, [], "")
+            evaluator = Evaluator(
+                snapshot, lambda ids, phrase: self._verify_phrase(conn, ids, phrase)
+            )
+            matches = evaluator.evaluate(core)
+            if filters and matches.ids.size:
+                matches = self._apply_filters(conn, matches, filters)
+            ranked, total = top_k(matches, snapshot.excluded, need)
+            outcome = Outcome(
+                [ScoredDoc(i, s) for i, s in ranked], SearchStats(strategy="boolean"), total
+            )
+            hits = self._hits(conn, outcome, _positive_terms(core))
+        return PgSearchResult(total, hits[offset:], "boolean", evaluator.approximate)
+
+    @staticmethod
+    def _verify_phrase(
+        conn: psycopg.Connection,
+        ids: np.ndarray[tuple[int], np.dtype[np.int64]],
+        phrase: tuple[str, ...],
+    ) -> np.ndarray[tuple[int], np.dtype[np.int64]]:
+        """Candidate documents whose text really contains the phrase (checked 200 at a time)."""
+        verified: list[int] = []
+        for start in range(0, ids.size, 200):
+            chunk = [int(i) for i in ids[start : start + 200]]
+            for doc_id, content in conn.execute(
+                "SELECT id, content FROM documents WHERE id = ANY(%s)", (chunk,)
+            ):
+                if text_contains_phrase(content, phrase):
+                    verified.append(doc_id)
+        return np.array(sorted(verified), dtype=np.int64)
+
+    @staticmethod
+    def _apply_filters(
+        conn: psycopg.Connection, matches: Matches, filters: list[AFilter]
+    ) -> Matches:
+        clauses = [_filter_clause(item) for item in filters]
+        sql = " AND ".join(clause for clause, _ in clauses)
+        params = [p for _, values in clauses for p in values]
+        keep: set[int] = set()
+        for start in range(0, matches.ids.size, 20_000):
+            chunk = [int(i) for i in matches.ids[start : start + 20_000]]
+            keep.update(
+                r[0]
+                for r in conn.execute(
+                    f"SELECT id FROM documents WHERE id = ANY(%s) AND {sql}", (chunk, *params)
+                )
+            )
+        mask = np.isin(matches.ids, np.fromiter(keep, dtype=np.int64, count=len(keep)))
+        return Matches(matches.ids[mask], matches.scores[mask])
 
     def _snapshot(self, conn: psycopg.Connection, terms: list[str]) -> _Snapshot:
         meta: dict[str, int] = dict(conn.execute("SELECT key, value FROM meta").fetchall())
