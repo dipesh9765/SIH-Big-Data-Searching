@@ -139,7 +139,13 @@ class S3Store:
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
         self._bucket = bucket
         if create_bucket and not self._client.bucket_exists(bucket):
-            self._client.make_bucket(bucket)
+            try:
+                self._client.make_bucket(bucket)
+            except S3Error as exc:
+                # Several processes (the API and each worker) start together and all create the
+                # bucket; losing that race is success, not an error.
+                if exc.code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+                    raise
 
     def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         self._client.put_object(

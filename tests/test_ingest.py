@@ -687,3 +687,32 @@ def test_ocr_end_to_end_makes_scanned_content_searchable(
     with index.connection() as conn:
         rows = conn.execute("SELECT ocr_confidence FROM assets ORDER BY id").fetchall()
     assert all(r[0] is not None and 40 <= r[0] <= 100 for r in rows)
+
+
+def test_starting_two_processes_at_once_does_not_fail_on_the_bucket_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typing import Any
+    from unittest.mock import MagicMock
+
+    from minio.error import S3Error
+
+    def failing(code: str) -> type:
+        class Client:
+            def __init__(self, *_a: object, **_k: object) -> None:
+                pass
+
+            def bucket_exists(self, _bucket: str) -> bool:
+                return False  # looked absent...
+
+            def make_bucket(self, _bucket: str) -> None:
+                response: Any = MagicMock()
+                raise S3Error(response, code, "x", "/b", "req", "host")  # ...then lost the race
+
+        return Client
+
+    monkeypatch.setattr("docsearch.ingest.objects.Minio", failing("BucketAlreadyOwnedByYou"))
+    S3Store("x:1", "k", "s", "bucket")  # losing the race is success: must not raise
+    monkeypatch.setattr("docsearch.ingest.objects.Minio", failing("AccessDenied"))
+    with pytest.raises(S3Error):
+        S3Store("x:1", "k", "s", "bucket")  # other failures still surface

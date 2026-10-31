@@ -166,6 +166,7 @@ class StatsOut(BaseModel):
     accepted_extensions: list[str]
     max_upload_bytes: int
     version: str
+    semantic: bool
 
 
 _ASSET_COLUMNS = (
@@ -642,6 +643,7 @@ def create_service_app(
             accepted_extensions=service_extensions(),
             max_upload_bytes=settings.max_upload_bytes,
             version=__version__,
+            semantic=vectors is not None,
         )
 
     if settings.web_dir and Path(settings.web_dir).is_dir():
