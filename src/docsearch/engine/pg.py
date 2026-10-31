@@ -19,6 +19,7 @@ all blocks of each of its terms), connection pooling.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import threading
 from collections.abc import Iterable, Iterator, Sequence
@@ -33,10 +34,16 @@ import psycopg
 from psycopg import IsolationLevel
 from psycopg_pool import ConnectionPool
 
-from docsearch.analysis import query_terms, term_frequencies
+from docsearch.analysis import (
+    query_terms,
+    term_frequencies,
+    term_frequencies_with_surfaces,
+    tokenize,
+)
 from docsearch.engine.boolean import Evaluator, Matches, top_k
 from docsearch.engine.codec import BLOCK_SIZE, Block, build_blocks, encode_block, iter_postings
 from docsearch.engine.search import Mode, Outcome, Pruning, ScoredDoc, SearchStats, search
+from docsearch.engine.terms import edit_distance, max_edits_for
 from docsearch.index import Document, EmptyDocumentError, make_snippet
 from docsearch.query import (
     AAnd,
@@ -53,6 +60,8 @@ from docsearch.query import (
 
 # Advisory locks are (class, hash of the schema name) so indexes in different schemas of one
 # database never block each other.
+log = logging.getLogger("docsearch.pg")
+
 _WRITE_LOCK = 1  # one ingest transaction at a time
 _COMPACT_LOCK = 2  # one compactor at a time
 _SCHEMA_NAME = re.compile(r"[a-z_][a-z0-9_]{0,40}")
@@ -291,13 +300,31 @@ class PgIndex:
             dsn,
             min_size=1,
             max_size=pool_size,
-            kwargs={"options": f"-c search_path={schema}"},
+            kwargs={"options": f"-c search_path={schema},public"},
             open=True,
         )
+        self._try_trigram_index(dsn)
         with self._pool.connection() as conn:
             conn.execute(
                 resources.files("docsearch.engine").joinpath("pg_schema.sql").read_text("utf-8")
             )
+
+    def _try_trigram_index(self, dsn: str) -> None:
+        """Install pg_trgm (in `public`) and its index on terms, if the database allows it.
+        Without it everything works except typo correction."""
+        try:
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public")
+            with self._pool.connection() as conn:
+                conn.execute(
+                    resources.files("docsearch.engine").joinpath("pg_schema.sql").read_text("utf-8")
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS terms_trgm ON terms"
+                    " USING gin (term public.gin_trgm_ops)"
+                )
+        except psycopg.Error:
+            log.warning("pg_trgm unavailable: typo correction is disabled", exc_info=True)
 
     @property
     def dsn(self) -> str:
@@ -357,9 +384,12 @@ class PgIndex:
 
     def _add(self, docs: Sequence[NewDocument], *, skip_empty: bool) -> list[Added | None]:
         prepared: list[tuple[NewDocument, dict[str, int], int, bytes]] = []
+        surfaces: dict[str, str] = {}  # first written form seen for each term in this batch
         slots: list[int | None] = []  # per input document: its position in `prepared`, or None
         for doc in docs:
-            frequencies, length = term_frequencies(doc.text)
+            frequencies, length, found_surfaces = term_frequencies_with_surfaces(doc.text)
+            for term, written in found_surfaces.items():
+                surfaces.setdefault(term, written)
             if length == 0:
                 if not skip_empty:
                     raise EmptyDocumentError(f"document {doc.title!r} contains no indexable text")
@@ -410,7 +440,7 @@ class PgIndex:
             counts_by_digest = {digest: (counts, length) for _, counts, length, digest in fresh}
             new_docs = [(doc_id, counts_by_digest[digest][0]) for digest, doc_id in ids.items()]
             if new_docs:
-                self._write_postings(conn, new_docs)
+                self._write_postings(conn, new_docs, surfaces)
                 added_tokens = sum(counts_by_digest[digest][1] for digest in ids)
                 for key, delta in (
                     ("doc_count", len(new_docs)),
@@ -433,13 +463,16 @@ class PgIndex:
 
     @staticmethod
     def _write_postings(
-        conn: psycopg.Connection, items: Iterable[tuple[int, dict[str, int]]]
+        conn: psycopg.Connection,
+        items: Iterable[tuple[int, dict[str, int]]],
+        surfaces: dict[str, str],
     ) -> None:
         documents = list(items)
         vocabulary = sorted({term for _, counts in documents for term in counts})
         conn.execute(
-            "INSERT INTO terms (term) SELECT unnest(%s::text[]) ON CONFLICT (term) DO NOTHING",
-            (vocabulary,),
+            "INSERT INTO terms (term, surface) SELECT * FROM unnest(%s::text[], %s::text[])"
+            " ON CONFLICT (term) DO NOTHING",
+            (vocabulary, [surfaces.get(term, term) for term in vocabulary]),
         )
         term_ids = {
             term: term_id
@@ -897,6 +930,73 @@ class PgIndex:
         )
         conn.execute("UPDATE meta SET value = value + 1 WHERE key = 'generation'")
         return len(rows), removed
+
+    # -------------------------------------------------------- autocomplete and correction
+
+    def complete(self, prefix: str, limit: int = 8) -> list[str]:
+        """Words that start with `prefix`, most frequent first (shown as written, not stemmed)."""
+        prefix = prefix.strip().casefold()
+        if not prefix or limit < 1:
+            return []
+        pattern = _like(prefix) + "%"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT coalesce(surface, term), doc_freq FROM terms"
+                " WHERE term LIKE %s OR surface LIKE %s ORDER BY doc_freq DESC, term LIMIT %s",
+                (pattern, pattern, limit * 3),
+            ).fetchall()
+        words: list[str] = []
+        for word, _ in rows:
+            if word not in words:
+                words.append(word)
+        return words[:limit]
+
+    def correct(self, word: str, limit: int = 3) -> list[str]:
+        """Known words within the typo budget of `word` (0 edits up to 3 letters, 1 up to 7,
+        2 beyond), closest then most frequent. Candidates come from the trigram index and are
+        verified with a real edit distance."""
+        stems = query_terms(word)
+        if len(stems) != 1:
+            return []
+        term = stems[0]
+        budget = max_edits_for(term)
+        if budget == 0:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT term, coalesce(surface, term), doc_freq FROM terms WHERE term %% %s"
+                    " ORDER BY similarity(term, %s) DESC LIMIT 60",
+                    (term, term),
+                ).fetchall()
+        except psycopg.errors.UndefinedFunction:  # pg_trgm is not installed: no corrections
+            return []
+        ranked: list[tuple[int, int, str]] = []
+        for candidate, shown, doc_freq in rows:
+            distance = edit_distance(term, candidate, budget)
+            if distance == 0:
+                return []  # the word is already in the dictionary
+            if distance is not None:
+                ranked.append((distance, -doc_freq, shown))
+        return [shown for _, _, shown in sorted(ranked)[:limit]]
+
+    def did_you_mean(self, text: str) -> str | None:
+        """The query with each unknown, correctable word replaced by its best correction."""
+        pieces: list[str] = []
+        cursor = 0
+        changed = False
+        for token in tokenize(text):
+            if self.search(token.surface, limit=1).hits:
+                continue
+            fixes = self.correct(token.surface, limit=1)
+            if fixes:
+                pieces.append(text[cursor : token.start] + fixes[0])
+                cursor = token.end
+                changed = True
+        if not changed:
+            return None
+        pieces.append(text[cursor:])
+        return "".join(pieces)
 
     # ---------------------------------------------------------------------------- documents
 

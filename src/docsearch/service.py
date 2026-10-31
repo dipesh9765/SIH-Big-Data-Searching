@@ -135,6 +135,7 @@ class SearchOut(BaseModel):
     query: str
     mode: Literal["all", "any"]
     total: int | None  # None: pruning skipped matches, so the exact count is not known
+    did_you_mean: str | None = None  # a corrected query, offered only when nothing matched
     approximate: bool  # a phrase had more candidates than the engine verified
     strategy: str
     took_ms: float
@@ -456,10 +457,20 @@ def create_service_app(
             mode=mode,
             total=result.total,
             approximate=result.approximate,
+            did_you_mean=None if result.hits else index.did_you_mean(q),
             strategy=result.strategy,
             took_ms=round((time.perf_counter() - started) * 1000, 2),
             results=[HitOut.of(h) for h in result.hits],
         )
+
+    @app.get("/v1/suggest", response_model=list[str])
+    def suggest(
+        q: Annotated[str, Query(min_length=1, max_length=100)],
+        limit: Annotated[int, Query(ge=1, le=20)] = 8,
+    ) -> list[str]:
+        """Autocomplete: words starting with the last word typed."""
+        words = q.split()
+        return index.complete(words[-1], limit=limit) if words else []
 
     @app.get("/v1/stats", response_model=StatsOut)
     def stats() -> StatsOut:

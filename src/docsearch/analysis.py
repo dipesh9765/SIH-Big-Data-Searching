@@ -96,6 +96,7 @@ class Token:
     term: str
     start: int
     end: int
+    surface: str = ""  # the word as written (lower-cased), before stemming
 
 
 def tokenize(text: str) -> list[Token]:
@@ -119,7 +120,7 @@ def tokenize(text: str) -> list[Token]:
             if word in STOP_WORDS:
                 continue
             term = stem(word)
-        tokens.append(Token(term, match.start(), match.end()))
+        tokens.append(Token(term, match.start(), match.end(), word))
     return tokens
 
 
@@ -143,6 +144,17 @@ def term_frequencies(text: str) -> tuple[Counter[str], int]:
     """Return ({term: count}, total indexed tokens) for `text`."""
     counts = Counter(token.term for token in tokenize(text))
     return counts, sum(counts.values())
+
+
+def term_frequencies_with_surfaces(text: str) -> tuple[Counter[str], int, dict[str, str]]:
+    """Like `term_frequencies`, plus the first written form seen for each term, so a stemmed term
+    ("oper") can be shown to people as a word ("operation")."""
+    tokens = tokenize(text)
+    counts = Counter(token.term for token in tokens)
+    surfaces: dict[str, str] = {}
+    for token in tokens:
+        surfaces.setdefault(token.term, token.surface)
+    return counts, sum(counts.values()), surfaces
 
 
 def query_terms(query: str) -> list[str]:

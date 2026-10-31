@@ -114,3 +114,9 @@ CREATE INDEX IF NOT EXISTS documents_deleted ON documents (id) WHERE deleted_at 
 CREATE INDEX IF NOT EXISTS documents_unpurged ON documents (id)
     WHERE deleted_at IS NOT NULL AND purged_at IS NULL;
 INSERT INTO meta (key, value) VALUES ('deletions', 0) ON CONFLICT (key) DO NOTHING;
+
+-- Autocomplete and typo correction over the term dictionary. `surface` is a readable form of the
+-- (stemmed) term; the trigram index needs the pg_trgm extension (installed in `public`).
+ALTER TABLE terms ADD COLUMN IF NOT EXISTS surface text;
+CREATE INDEX IF NOT EXISTS terms_prefix ON terms (term text_pattern_ops);
+CREATE INDEX IF NOT EXISTS terms_surface_prefix ON terms (surface text_pattern_ops);
