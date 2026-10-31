@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import io
 import threading
+import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +21,13 @@ from minio.error import S3Error
 
 class ObjectNotFoundError(KeyError):
     """The key is not in the store."""
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectInfo:
+    key: str
+    size: int
+    modified: float  # seconds since the epoch
 
 
 class ObjectStore(Protocol):
@@ -43,6 +53,8 @@ class ObjectStore(Protocol):
         """`length` bytes from `start` (fewer at the end of the object)."""
         ...
 
+    def list_objects(self, prefix: str) -> Iterator[ObjectInfo]: ...
+
     def ping(self) -> None:
         """Raise if the store cannot be reached."""
         ...
@@ -61,10 +73,12 @@ class MemoryStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._objects: dict[str, bytes] = {}
+        self._modified: dict[str, float] = {}
 
     def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         with self._lock:
             self._objects[key] = bytes(data)
+            self._modified[key] = time.time()
 
     def get(self, key: str) -> bytes:
         with self._lock:
@@ -80,6 +94,7 @@ class MemoryStore:
     def delete(self, key: str) -> None:
         with self._lock:
             self._objects.pop(key, None)
+            self._modified.pop(key, None)
 
     def put_file(
         self, key: str, path: Path, content_type: str = "application/octet-stream"
@@ -94,6 +109,15 @@ class MemoryStore:
 
     def get_range(self, key: str, start: int, length: int) -> bytes:
         return self.get(key)[start : start + length]
+
+    def list_objects(self, prefix: str) -> Iterator[ObjectInfo]:
+        with self._lock:
+            snapshot = [
+                ObjectInfo(k, len(v), self._modified[k])
+                for k, v in self._objects.items()
+                if k.startswith(prefix)
+            ]
+        yield from snapshot
 
     def ping(self) -> None:
         return None
@@ -180,6 +204,13 @@ class S3Store:
 
     def delete(self, key: str) -> None:
         self._client.remove_object(self._bucket, key)
+
+    def list_objects(self, prefix: str) -> Iterator[ObjectInfo]:
+        for item in self._client.list_objects(self._bucket, prefix=prefix, recursive=True):
+            if item.object_name is None or item.is_dir:
+                continue
+            modified = item.last_modified.timestamp() if item.last_modified else 0.0
+            yield ObjectInfo(item.object_name, int(item.size or 0), modified)
 
     def ping(self) -> None:
         self._client.bucket_exists(self._bucket)

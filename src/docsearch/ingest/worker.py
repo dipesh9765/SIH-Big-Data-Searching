@@ -22,9 +22,10 @@ from docsearch import asr as asr_module
 from docsearch.asr import AsrConfig
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import PgIndex
+from docsearch.ingest.maintenance import collect_orphans, prune_jobs
 from docsearch.ingest.objects import ObjectStore, S3Store
 from docsearch.ingest.pipeline import BatchResult, process_batch
-from docsearch.ingest.queue import JobQueue
+from docsearch.ingest.queue import JobQueue, Wakeup
 from docsearch.ocr import OcrConfig, check_ready
 
 log = logging.getLogger("docsearch.worker")
@@ -73,8 +74,10 @@ class Worker:
             lease_seconds=self.lease_seconds,
         )
 
-    def run(self, stop: threading.Event, *, poll_interval: float = 1.0) -> None:
-        """Process until `stop` is set, sleeping `poll_interval` when the queue is empty."""
+    def run(self, stop: threading.Event, *, poll_interval: float = 5.0) -> None:
+        """Process until `stop` is set. When the queue is empty, sleep until a job is queued
+        (LISTEN/NOTIFY) or `poll_interval` seconds pass, whichever comes first."""
+        wakeup = _try_wakeup(self.index)
         log.info(
             "worker %s started (kinds=%s, batch=%d)", self.worker_id, self.kinds, self.batch_size
         )
@@ -86,7 +89,7 @@ class Worker:
                 stop.wait(poll_interval * 5)
                 continue
             if result == BatchResult():
-                stop.wait(poll_interval)
+                _sleep(stop, wakeup, poll_interval)
             else:
                 log.info(
                     "batch: %d indexed, %d retried, %d failed, %d rerouted, %d lost",
@@ -96,7 +99,47 @@ class Worker:
                     result.rerouted,
                     result.lost,
                 )
+        if wakeup is not None:
+            wakeup.close()
         log.info("worker %s stopped", self.worker_id)
+
+
+def _sleep(stop: threading.Event, wakeup: Wakeup | None, seconds: float) -> None:
+    """Sleep until a job is announced, `seconds` pass, or `stop` is set (checked every second, so
+    shutdown is prompt even though a notification wait blocks)."""
+    if wakeup is None:
+        stop.wait(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while not stop.is_set() and (left := deadline - time.monotonic()) > 0:
+        if wakeup.wait(min(1.0, left)):
+            return
+
+
+def _try_wakeup(index: PgIndex) -> Wakeup | None:
+    try:
+        return Wakeup(index)
+    except Exception:
+        log.warning("LISTEN/NOTIFY unavailable; falling back to polling", exc_info=True)
+        return None
+
+
+def run_maintenance(
+    index: PgIndex,
+    store: ObjectStore,
+    stop: threading.Event,
+    interval: float,
+) -> None:
+    """Prune old job rows and collect orphaned objects every `interval` seconds."""
+    while not stop.wait(interval):
+        try:
+            pruned = prune_jobs(index)
+            orphans = collect_orphans(index, store)
+        except Exception:
+            log.exception("maintenance failed; will retry")
+            continue
+        if pruned or orphans:
+            log.info("maintenance: pruned %d jobs, deleted %d orphaned objects", pruned, orphans)
 
 
 def run_compactor(index: PgIndex, stop: threading.Event, interval: float) -> None:
@@ -134,7 +177,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--lease", type=float, default=None, help="job lease seconds (default 300; 900 for ocr)"
     )
     parser.add_argument("--kinds", default="text", help="comma-separated job kinds to handle")
-    parser.add_argument("--poll", type=float, default=1.0, help="seconds to wait on an empty queue")
+    parser.add_argument(
+        "--poll", type=float, default=5.0, help="max seconds to sleep on an empty queue"
+    )
+    parser.add_argument(
+        "--maintenance-interval",
+        type=float,
+        default=0.0,
+        help="also prune old jobs and delete orphaned objects every N seconds (0: off)",
+    )
     parser.add_argument(
         "--compact-interval",
         type=float,
@@ -179,6 +230,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: stop.set())
+        if args.maintenance_interval > 0:
+            threading.Thread(
+                target=run_maintenance,
+                args=(index, worker.store, stop, args.maintenance_interval),
+                daemon=True,
+            ).start()
         if args.compact_interval > 0:
             threading.Thread(
                 target=run_compactor, args=(index, stop, args.compact_interval), daemon=True

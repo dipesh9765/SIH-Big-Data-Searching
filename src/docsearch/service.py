@@ -48,6 +48,7 @@ from docsearch.ingest.pipeline import (
 )
 from docsearch.ingest.queue import JobQueue
 from docsearch.ingest.worker import build_store
+from docsearch.metrics import Registry
 from docsearch.web import error, install_guard
 
 log = logging.getLogger("docsearch.service")
@@ -224,6 +225,38 @@ def create_service_app(
     index = index or PgIndex(settings.dsn, schema=settings.schema)
     store = store or build_store(settings)
     queue = JobQueue(index)
+    metrics = Registry()
+    metrics.describe(
+        "docsearch_http_requests_total", "counter", "HTTP requests by route and status"
+    )
+    metrics.describe(
+        "docsearch_http_request_duration_seconds", "histogram", "HTTP request latency by route"
+    )
+
+    def gauges() -> Iterator[tuple[str, dict[str, str], float]]:
+        try:
+            counts = index.approximate_counts()
+            jobs = queue.counts()
+            with index.connection() as conn:
+                assets: dict[str, int] = dict(
+                    conn.execute("SELECT status, count(*) FROM assets GROUP BY status")
+                )
+        except Exception:  # a scrape must not fail because the database is briefly unavailable
+            log.exception("could not collect gauges")
+            yield "docsearch_up", {}, 0.0
+            return
+        yield "docsearch_up", {}, 1.0
+        yield "docsearch_documents", {}, counts["documents"]
+        yield "docsearch_indexed_tokens", {}, counts["tokens"]
+        yield "docsearch_terms_estimate", {}, counts["terms_estimate"]
+        yield "docsearch_delta_postings_estimate", {}, counts["delta_postings_estimate"]
+        yield "docsearch_posting_blocks_estimate", {}, counts["blocks_estimate"]
+        for state, value in jobs.items():
+            yield "docsearch_jobs", {"state": state}, value
+        for status in ("queued", "processing", "indexed", "failed"):
+            yield "docsearch_assets", {"status": status}, int(assets.get(status, 0))
+
+    metrics.gauge_source(gauges)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -240,11 +273,16 @@ def create_service_app(
     )
     # Audio and video are far larger than documents, so the early body-size check uses the
     # larger limit and each route enforces the limit for its own type.
-    install_guard(app, max(settings.max_upload_bytes, settings.max_media_bytes))
+    install_guard(app, max(settings.max_upload_bytes, settings.max_media_bytes), metrics)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus() -> Response:
+        """Prometheus scrape endpoint. Unauthenticated: expose it on the internal network only."""
+        return Response(metrics.render(), media_type="text/plain; version=0.0.4")
 
     @app.get("/readyz")
     def readyz() -> dict[str, object]:

@@ -33,7 +33,7 @@ LOW_LOGPROB = -1.0
 
 @dataclass(frozen=True, slots=True)
 class AsrConfig:
-    model: str = "base"  # tiny / base / small / medium / large-v3 ... or a path
+    model: str = "small"  # tiny / base / small / medium / large-v3 ... or a path
     model_dir: str = ""  # where model files live (empty: the library's default cache)
     language: str = ""  # ISO code such as "hi", "mr", "en"; empty: detect from the audio
     max_minutes: int = 240

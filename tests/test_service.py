@@ -338,3 +338,23 @@ def test_search_hits_in_a_recording_point_at_the_moment_and_the_file(
         False,
     }  # recordings link out; documents do not
     assert plain
+
+
+def test_metrics_endpoint_reports_requests_queue_and_documents(rig: Rig) -> None:
+    rig.upload("a.txt", b"metrics test document about rainfall")
+    rig.client.get("/v1/assets/999")  # a 404 on a templated route
+    text = rig.client.get("/metrics").text
+    assert "docsearch_up 1" in text
+    assert (
+        'docsearch_http_requests_total{method="POST",route="/v1/documents",status="202"} 1' in text
+    )
+    assert (
+        'route="/v1/assets/{asset_id}",status="404"' in text
+    )  # the template, not "/v1/assets/999"
+    assert 'docsearch_jobs{state="queued"} 1' in text
+    assert 'docsearch_assets{status="queued"} 1' in text
+    rig.drain()
+    after = rig.client.get("/metrics").text
+    assert "docsearch_documents 1" in after
+    assert 'docsearch_jobs{state="done"} 1' in after
+    assert "docsearch_http_request_duration_seconds_bucket" in after

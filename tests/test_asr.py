@@ -236,7 +236,7 @@ def ffmpeg(*args: str) -> None:
 @pytest.fixture(scope="module")
 def real_config() -> AsrConfig:
     return AsrConfig(
-        model=os.environ.get("DOCSEARCH_ASR_MODEL", "base"),
+        model=os.environ.get("DOCSEARCH_ASR_MODEL", "small"),
         model_dir=os.environ.get("DOCSEARCH_ASR_MODEL_DIR", ""),
     )
 

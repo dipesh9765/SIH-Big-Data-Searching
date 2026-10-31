@@ -204,6 +204,14 @@ class PgIndex:
                 resources.files("docsearch.engine").joinpath("pg_schema.sql").read_text("utf-8")
             )
 
+    @property
+    def dsn(self) -> str:
+        return self._dsn
+
+    @property
+    def schema(self) -> str:
+        return self._schema
+
     def close(self) -> None:
         """Close the connection pool. Safe to call more than once."""
         self._pool.close()
@@ -594,6 +602,27 @@ class PgIndex:
         return PgStats(
             docs, terms, int(in_blocks), in_delta, meta["total_length"] / docs if docs else 0.0
         )
+
+    def approximate_counts(self) -> dict[str, int]:
+        """Cheap gauges for monitoring: exact document/token counters from `meta`, and planner
+        estimates for the big tables (a `count(*)` over millions of rows is too slow to scrape)."""
+        with self._connect() as conn:
+            meta: dict[str, int] = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            estimates: dict[str, int] = dict(
+                conn.execute(
+                    "SELECT relname, greatest(reltuples, 0)::bigint FROM pg_class"
+                    " WHERE relnamespace = to_regnamespace(%s)"
+                    " AND relname IN ('terms', 'postings_delta', 'postings_blocks')",
+                    (self._schema,),
+                ).fetchall()
+            )
+        return {
+            "documents": int(meta["doc_count"]),
+            "tokens": int(meta["total_length"]),
+            "terms_estimate": int(estimates.get("terms", 0)),
+            "delta_postings_estimate": int(estimates.get("postings_delta", 0)),
+            "blocks_estimate": int(estimates.get("postings_blocks", 0)),
+        }
 
     def drop_schema(self) -> None:
         """Remove everything this index created (tests use throwaway schemas)."""

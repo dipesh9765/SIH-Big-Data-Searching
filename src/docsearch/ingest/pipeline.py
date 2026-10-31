@@ -41,7 +41,7 @@ from docsearch.extract import (
     service_extensions,
 )
 from docsearch.ingest.objects import ObjectNotFoundError, ObjectStore, object_key
-from docsearch.ingest.queue import Job, JobQueue
+from docsearch.ingest.queue import Job, JobQueue, notify_channel
 from docsearch.ocr import OcrConfig, ocr_image, ocr_pdf
 
 log = logging.getLogger("docsearch.ingest")
@@ -158,6 +158,7 @@ def _register(  # noqa: PLR0913, PLR0917 - an internal step with plain arguments
     kind: str,
     max_attempts: int,
 ) -> Submission:
+    channel = notify_channel(index.schema)
     with index.connection() as conn:
         created = conn.execute(
             "INSERT INTO assets (object_key, sha256, source_name, title, size)"
@@ -166,7 +167,7 @@ def _register(  # noqa: PLR0913, PLR0917 - an internal step with plain arguments
         ).fetchone()
         if created is not None:
             return Submission(
-                created[0], _enqueue(conn, created[0], max_attempts, kind), "queued", False
+                created[0], _enqueue(conn, created[0], max_attempts, kind, channel), "queued", False
             )
         existing = conn.execute(
             "SELECT id, status FROM assets WHERE sha256 = %s FOR UPDATE", (digest,)
@@ -180,16 +181,17 @@ def _register(  # noqa: PLR0913, PLR0917 - an internal step with plain arguments
                 (asset_id,),
             )
             return Submission(
-                asset_id, _enqueue(conn, asset_id, max_attempts, kind), "queued", True
+                asset_id, _enqueue(conn, asset_id, max_attempts, kind, channel), "queued", True
             )
         return Submission(asset_id, None, status, True)
 
 
-def _enqueue(conn: object, asset_id: int, max_attempts: int, kind: str) -> int:
+def _enqueue(conn: object, asset_id: int, max_attempts: int, kind: str, channel: str) -> int:
     row = conn.execute(  # type: ignore[attr-defined]
         "INSERT INTO ingest_jobs (asset_id, kind, max_attempts) VALUES (%s, %s, %s) RETURNING id",
         (asset_id, kind, max_attempts),
     ).fetchone()
+    conn.execute("SELECT pg_notify(%s, '')", (channel,))  # type: ignore[attr-defined]  # on commit
     return int(row[0])
 
 

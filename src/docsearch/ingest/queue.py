@@ -18,6 +18,8 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import psycopg
+
 from docsearch.engine.pg import PgIndex
 
 BACKOFF_BASE_SECONDS = 5.0
@@ -44,6 +46,33 @@ def backoff_seconds(
     base = min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * 2 ** max(0, attempts - 1))
     spread = (rng or random).uniform(1 - jitter, 1 + jitter)
     return float(base * spread)
+
+
+def notify_channel(schema: str) -> str:
+    """The LISTEN/NOTIFY channel for a schema (schema names are validated identifiers)."""
+    return f"docsearch_jobs_{schema}"
+
+
+class Wakeup:
+    """Lets an idle worker sleep until a job is queued instead of polling the table.
+
+    Uses PostgreSQL LISTEN/NOTIFY on a dedicated connection. Notifications are an optimisation
+    only: a missed one (connection drop, a job that becomes due after a backoff) is covered because
+    `wait` returns after its timeout and the worker then polls the queue anyway.
+    """
+
+    def __init__(self, index: PgIndex) -> None:
+        self._conn = psycopg.connect(index.dsn, autocommit=True)
+        self._conn.execute(f'LISTEN "{notify_channel(index.schema)}"')
+
+    def wait(self, timeout: float) -> bool:
+        """Block up to `timeout` seconds; True if a notification arrived."""
+        for _ in self._conn.notifies(timeout=timeout, stop_after=1):
+            return True
+        return False
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 class JobQueue:
@@ -164,6 +193,7 @@ class JobQueue:
             conn.execute(
                 "UPDATE assets SET status = 'queued', updated_at = now() WHERE id = %s", (row[0],)
             )
+            conn.execute("SELECT pg_notify(%s, '')", (notify_channel(self._index.schema),))
             return True
 
     def extend(self, job_id: int, worker_id: str, lease_seconds: float) -> bool:

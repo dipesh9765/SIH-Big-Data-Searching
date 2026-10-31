@@ -14,8 +14,9 @@ ENV PYTHONUNBUFFERED=1 OMP_THREAD_LIMIT=1
 WORKDIR /app
 COPY requirements.txt requirements-ocr.txt requirements-asr.txt ./
 RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt -r requirements-asr.txt
-# Whisper model size: base (~140 MB, fast, weaker on Hindi/Marathi) or small (~480 MB, better).
-ARG ASR_MODEL=base
+# Whisper model size. small (~480 MB) is the default: the base model (~140 MB, ~2.5x faster) made
+# visible errors even on clean English and produced nothing usable for Hindi/Marathi (ADR 0012).
+ARG ASR_MODEL=small
 ENV DOCSEARCH_ASR_MODEL=${ASR_MODEL} DOCSEARCH_ASR_MODEL_DIR=/models
 RUN python -c "from faster_whisper import WhisperModel; import os; WhisperModel(os.environ['DOCSEARCH_ASR_MODEL'], device='cpu', compute_type='int8', download_root='/models')"  && chmod -R a+rX /models
 ENV HF_HUB_OFFLINE=1

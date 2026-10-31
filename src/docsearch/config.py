@@ -51,7 +51,7 @@ class ServiceSettings:
     ocr_languages: str = "eng+hin+mar"
     ocr_max_pages: int = 200
     max_media_bytes: int = 500 * 1024 * 1024
-    asr_model: str = "base"
+    asr_model: str = "small"
     asr_model_dir: str = ""
     asr_language: str = ""  # empty: detect from the audio
     asr_max_minutes: int = 240
