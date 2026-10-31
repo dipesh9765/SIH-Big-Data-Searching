@@ -757,6 +757,15 @@ class PgIndex:
         excluded = self._deleted_ids(conn, int(meta.get("deletions", 0)))
         return _Snapshot(doc_count, average, freqs, blocks, lengths, excluded)
 
+    def hits_for(self, scored: Sequence[tuple[int, float]], terms: set[str]) -> list[PgHit]:
+        """Hits (metadata, snippet, media reference) for documents chosen by some other ranking,
+        such as vector similarity. Deleted ids are expected to be filtered out by the caller."""
+        outcome = Outcome(
+            [ScoredDoc(i, s) for i, s in scored], SearchStats(strategy="external"), None
+        )
+        with self._connect() as conn:
+            return self._hits(conn, outcome, terms)
+
     @staticmethod
     def _hits(conn: psycopg.Connection, outcome: Outcome, terms: set[str]) -> list[PgHit]:
         if not outcome.hits:

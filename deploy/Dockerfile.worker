@@ -19,6 +19,14 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-ocr.txt -r re
 ARG ASR_MODEL=small
 ENV DOCSEARCH_ASR_MODEL=${ASR_MODEL} DOCSEARCH_ASR_MODEL_DIR=/models
 RUN python -c "from faster_whisper import WhisperModel; import os; WhisperModel(os.environ['DOCSEARCH_ASR_MODEL'], device='cpu', compute_type='int8', download_root='/models')"  && chmod -R a+rX /models
+# Semantic and image search. Kept as its own layers after the speech model so rebuilding it
+# does not re-download Whisper.
+COPY requirements-semantic.txt ./
+RUN pip install --no-cache-dir -r requirements-semantic.txt
+# Embedding models for semantic and image search: multilingual text (384-d, covers Hindi and
+# Marathi), and CLIP text/vision towers for searching images with words (512-d, English-centric).
+ENV DOCSEARCH_EMBED_CACHE=/models/embed
+RUN python -c "from fastembed import ImageEmbedding, TextEmbedding; c='/models/embed'; TextEmbedding('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', cache_dir=c); TextEmbedding('Qdrant/clip-ViT-B-32-text', cache_dir=c); ImageEmbedding('Qdrant/clip-ViT-B-32-vision', cache_dir=c)"  && chmod -R a+rX /models
 ENV HF_HUB_OFFLINE=1
 
 FROM base AS worker

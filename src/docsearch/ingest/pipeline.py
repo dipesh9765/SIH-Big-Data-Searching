@@ -332,6 +332,7 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
     ocr: OcrConfig | None = None,
     asr: AsrConfig | None = None,
     lease_seconds: float = 300.0,
+    embed: bool = False,
 ) -> BatchResult:
     """Extract and index the files behind `jobs`, then settle each job individually.
 
@@ -395,9 +396,19 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
 
     documents: list[NewDocument] = []
     spans: list[tuple[int, int]] = []  # per ready file: its slice of `documents`
+    photos: set[int] = set()  # image uploads with no text, kept because they can be embedded
     for job, title, extracted in ready:
         source_name = assets[job.asset_id][0]
         begin = len(documents)
+        if (
+            embed
+            and job.kind == "ocr"
+            and Path(source_name).suffix.lower() in IMAGE_MEDIA_TYPES
+            and not extracted.text.strip()
+        ):
+            photos.add(job.id)  # a picture without writing: searchable through its embedding
+            spans.append((begin, begin))
+            continue
         if extracted.units:
             documents.extend(
                 NewDocument(
@@ -434,7 +445,7 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
         return result_of()
     for (job, _, extracted), (begin, end) in zip(ready, spans, strict=True):
         results = [r for r in added[begin:end] if r is not None]
-        if not results:
+        if not results and job.id not in photos:
             reason = (
                 "no speech was recognised"
                 if extracted.units or extracted.duration_ms
@@ -448,7 +459,7 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
                 " ocr_confidence = %s, units = %s, duration_ms = %s, language = %s,"
                 " updated_at = now() WHERE id = %s",
                 (
-                    results[0].document_id,
+                    results[0].document_id if results else None,
                     extracted.confidence,
                     len(results),
                     extracted.duration_ms,
@@ -463,6 +474,13 @@ def process_batch(  # noqa: PLR0912, PLR0913, PLR0915 - one orchestration functi
             queue.complete(job.id, worker_id)
             lost += 1
             continue
+        if embed:
+            with index.connection() as conn:
+                conn.execute(
+                    "INSERT INTO ingest_jobs (asset_id, kind) VALUES (%s, 'embed')",
+                    (job.asset_id,),
+                )
+                conn.execute("SELECT pg_notify(%s, '')", (notify_channel(index.schema),))
         if queue.complete(job.id, worker_id):
             indexed += 1
         else:

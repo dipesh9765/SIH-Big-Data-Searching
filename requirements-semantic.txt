@@ -1,0 +1,2 @@
+# Semantic and image search (ONNX, CPU). Models are downloaded into the worker image at build time.
+fastembed==0.9.1

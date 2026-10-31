@@ -41,9 +41,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from docsearch import __version__
+from docsearch.analysis import query_terms
 from docsearch.api import DocumentOut
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import InvalidFilterError, PgHit, PgIndex
+from docsearch.engine.vectors import VectorStore, fuse
 from docsearch.extract import (
     SPEECH_MEDIA_TYPES,
     UnsupportedMediaTypeError,
@@ -61,6 +63,7 @@ from docsearch.ingest.pipeline import (
 from docsearch.ingest.queue import JobQueue
 from docsearch.ingest.worker import build_store
 from docsearch.metrics import Registry
+from docsearch.semantic import Embedder, FastEmbedder
 from docsearch.web import error, install_guard
 
 log = logging.getLogger("docsearch.service")
@@ -129,6 +132,14 @@ class HitOut(BaseModel):
                 file_url=f"/v1/assets/{hit.media.asset_id}/file",
             ),
         )
+
+
+class ImageHitOut(BaseModel):
+    asset_id: int
+    title: str
+    source_name: str
+    similarity: float
+    file_url: str
 
 
 class SearchOut(BaseModel):
@@ -232,13 +243,21 @@ def create_service_app(
     *,
     index: PgIndex | None = None,
     store: ObjectStore | None = None,
+    embedder: Embedder | None = None,
 ) -> FastAPI:
-    """Build the app. `index` and `store` may be injected (tests); else they come from settings."""
+    """Build the app. `index`, `store` and `embedder` may be injected (tests); else they come from
+    settings."""
     settings = settings or ServiceSettings.from_env()
     owns_index = index is None
     index = index or PgIndex(settings.dsn, schema=settings.schema)
     store = store or build_store(settings)
     queue = JobQueue(index)
+    vectors: VectorStore | None = None
+    if settings.semantic:
+        vectors = VectorStore(index)
+        embedder = embedder or FastEmbedder(settings.embed_cache)
+        if not vectors.available:
+            vectors = None
     metrics = Registry()
     metrics.describe(
         "docsearch_http_requests_total", "counter", "HTTP requests by route and status"
@@ -439,15 +458,22 @@ def create_service_app(
         return DocumentOut.of(document)
 
     @app.get("/v1/search", response_model=SearchOut)
-    def search(
+    def search(  # noqa: PLR0913, PLR0917 - every parameter is a documented query option
         q: Annotated[str, Query(min_length=1, max_length=500)],
         mode: Literal["all", "any"] = "all",
         limit: Annotated[int, Query(ge=1)] = 10,
         offset: Annotated[int, Query(ge=0, le=10_000)] = 0,
         exact_total: bool = False,
+        ranking: Literal["keyword", "semantic", "hybrid"] = "keyword",
     ) -> SearchOut:
+        """`ranking=keyword` is BM25 (with the query language); `semantic` ranks by meaning
+        (works across languages); `hybrid` fuses both with reciprocal rank fusion."""
         limit = min(limit, settings.max_results)
         started = time.perf_counter()
+        if ranking != "keyword":
+            if vectors is None or embedder is None:
+                raise error(501, "semantic search is not enabled on this server")
+            return _semantic_search(q, mode, limit, offset, ranking, started)
         try:
             result = index.query(q, mode=mode, limit=limit, offset=offset, exact_total=exact_total)
         except InvalidFilterError as exc:
@@ -462,6 +488,82 @@ def create_service_app(
             took_ms=round((time.perf_counter() - started) * 1000, 2),
             results=[HitOut.of(h) for h in result.hits],
         )
+
+    def _semantic_search(  # noqa: PLR0913, PLR0917 - a private helper with plain arguments
+        q: str,
+        mode: Literal["all", "any"],
+        limit: int,
+        offset: int,
+        ranking: str,
+        started: float,
+    ) -> SearchOut:
+        assert vectors is not None
+        assert embedder is not None
+        need = offset + limit
+        terms = set(query_terms(q))
+        semantic = vectors.search_text(embedder.embed_query(q), max(need, 50))
+        if ranking == "semantic":
+            scored = semantic[offset:need]
+            hits = index.hits_for(scored, terms)
+            strategy = "semantic"
+        else:
+            keyword = index.query(q, mode=mode, limit=max(need, 50)).hits
+            fused = fuse([[h.document.id for h in keyword], [d for d, _ in semantic]])
+            known = {h.document.id: h for h in keyword}
+            page = fused[offset:need]
+            extra = index.hits_for([(d, s) for d, s in page if d not in known], terms)
+            built = {h.document.id: h for h in extra}
+            hits = [
+                PgHit(
+                    (known.get(d) or built[d]).document,
+                    s,
+                    (known.get(d) or built[d]).snippet,
+                    (known.get(d) or built[d]).highlights,
+                    (known.get(d) or built[d]).media,
+                )
+                for d, s in page
+            ]
+            strategy = "hybrid"
+        return SearchOut(
+            query=q,
+            mode=mode,
+            total=None,
+            approximate=False,
+            strategy=strategy,
+            took_ms=round((time.perf_counter() - started) * 1000, 2),
+            results=[HitOut.of(h) for h in hits],
+        )
+
+    @app.get("/v1/search/images", response_model=list[ImageHitOut])
+    def search_images(
+        q: Annotated[str, Query(min_length=1, max_length=200)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    ) -> list[ImageHitOut]:
+        """Find pictures by describing them (CLIP). Needs semantic search to be enabled."""
+        if vectors is None or embedder is None:
+            raise error(501, "image search is not enabled on this server")
+        found = vectors.search_images(embedder.embed_image_query(q), limit)
+        if not found:
+            return []
+        with index.connection() as conn:
+            rows = {
+                r[0]: r
+                for r in conn.execute(
+                    "SELECT id, title, source_name FROM assets WHERE id = ANY(%s)",
+                    ([a for a, _ in found],),
+                )
+            }
+        return [
+            ImageHitOut(
+                asset_id=a,
+                title=rows[a][1],
+                source_name=rows[a][2],
+                similarity=round(s, 4),
+                file_url=f"/v1/assets/{a}/file",
+            )
+            for a, s in found
+            if a in rows
+        ]
 
     @app.get("/v1/suggest", response_model=list[str])
     def suggest(

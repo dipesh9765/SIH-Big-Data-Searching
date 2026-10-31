@@ -56,6 +56,8 @@ class ServiceSettings:
     asr_language: str = ""  # empty: detect from the audio
     asr_max_minutes: int = 240
     api_key: str = ""  # when set, every /v1 route requires it
+    semantic: bool = False  # embeddings, semantic and image search (needs pgvector)
+    embed_cache: str = ""  # where the embedding models are stored
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ServiceSettings:
@@ -79,6 +81,8 @@ class ServiceSettings:
             ocr_max_pages=_positive_int(env, "DOCSEARCH_OCR_MAX_PAGES", defaults.ocr_max_pages),
             max_media_bytes=_positive_int(env, "DOCSEARCH_MAX_MEDIA_MB", 500) * 1024 * 1024,
             api_key=env.get("DOCSEARCH_API_KEY", defaults.api_key),
+            semantic=env.get("DOCSEARCH_SEMANTIC", "").strip().lower() in ("1", "true", "yes"),
+            embed_cache=env.get("DOCSEARCH_EMBED_CACHE", defaults.embed_cache),
             asr_model=env.get("DOCSEARCH_ASR_MODEL", defaults.asr_model),
             asr_model_dir=env.get("DOCSEARCH_ASR_MODEL_DIR", defaults.asr_model_dir),
             asr_language=env.get("DOCSEARCH_ASR_LANGUAGE", defaults.asr_language),

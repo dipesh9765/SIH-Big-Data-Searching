@@ -22,11 +22,14 @@ from docsearch import asr as asr_module
 from docsearch.asr import AsrConfig
 from docsearch.config import ServiceSettings
 from docsearch.engine.pg import PgIndex
+from docsearch.engine.vectors import VectorStore
+from docsearch.ingest.embed import process_embed_jobs
 from docsearch.ingest.maintenance import collect_orphans, prune_jobs
 from docsearch.ingest.objects import ObjectStore, S3Store
 from docsearch.ingest.pipeline import BatchResult, process_batch
 from docsearch.ingest.queue import JobQueue, Wakeup
 from docsearch.ocr import OcrConfig, check_ready
+from docsearch.semantic import Embedder, FastEmbedder
 
 log = logging.getLogger("docsearch.worker")
 
@@ -47,6 +50,8 @@ class Worker:
         lease_seconds: float = 300.0,
         ocr: OcrConfig | None = None,
         asr: AsrConfig | None = None,
+        embedder: Embedder | None = None,
+        enqueue_embeddings: bool = False,
     ) -> None:
         self.index = index
         self.store = store
@@ -57,21 +62,48 @@ class Worker:
         self.lease_seconds = lease_seconds
         self.ocr = ocr or OcrConfig()
         self.asr = asr or AsrConfig()
+        self.embedder = embedder
+        self.enqueue_embeddings = enqueue_embeddings
+        self._vectors: VectorStore | None = None
 
     def run_once(self) -> BatchResult:
         """Claim and process one batch; an empty result means there was nothing to do."""
         jobs = self.queue.claim(
             self.worker_id, self.kinds, limit=self.batch_size, lease_seconds=self.lease_seconds
         )
-        return process_batch(
+        embed_jobs = [j for j in jobs if j.kind == "embed"]
+        result = process_batch(
             self.index,
             self.queue,
             self.store,
-            jobs,
+            [j for j in jobs if j.kind != "embed"],
             self.worker_id,
             ocr=self.ocr,
             asr=self.asr,
             lease_seconds=self.lease_seconds,
+            embed=self.enqueue_embeddings,
+        )
+        if not embed_jobs:
+            return result
+        if self.embedder is None:
+            raise RuntimeError("an embed job was claimed by a worker with no embedding model")
+        if self._vectors is None:
+            self._vectors = VectorStore(self.index)
+        done = process_embed_jobs(
+            self.index,
+            self.queue,
+            self.store,
+            self._vectors,
+            self.embedder,
+            embed_jobs,
+            self.worker_id,
+        )
+        return BatchResult(
+            result.indexed + done.indexed,
+            result.retried + done.retried,
+            result.failed + done.failed,
+            result.rerouted,
+            result.lost + done.lost,
         )
 
     def run(self, stop: threading.Event, *, poll_interval: float = 5.0) -> None:
@@ -216,7 +248,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             except RuntimeError as exc:
                 log.error("cannot start a %s worker: %s", kind, exc)
                 raise SystemExit(2) from exc
-    heavy = "ocr" in kinds or "asr" in kinds
+    embedder: Embedder | None = None
+    if "embed" in kinds:
+        embedder = FastEmbedder(settings.embed_cache)
+        try:
+            embedder.embed_texts(["ready"])  # loads the model now, so a bad install fails here
+        except Exception as exc:
+            log.error("cannot start an embed worker: %s", exc)
+            raise SystemExit(2) from exc
+    heavy = "ocr" in kinds or "asr" in kinds or "embed" in kinds
     with PgIndex(settings.dsn, schema=settings.schema) as index:
         worker = Worker(
             index,
@@ -226,6 +266,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             lease_seconds=args.lease or (900.0 if heavy else 300.0),
             ocr=ocr,
             asr=asr,
+            embedder=embedder,
+            enqueue_embeddings=settings.semantic,
         )
         stop = threading.Event()
         for signum in (signal.SIGINT, signal.SIGTERM):

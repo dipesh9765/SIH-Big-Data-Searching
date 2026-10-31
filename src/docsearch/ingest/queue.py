@@ -94,10 +94,10 @@ class JobQueue:
                 " UPDATE ingest_jobs SET state = 'dead', locked_by = NULL, updated_at = now(),"
                 "  last_error = 'worker lost the job too many times'"
                 " WHERE state = 'running' AND locked_until < now() AND attempts >= max_attempts"
-                " RETURNING asset_id)"
+                " RETURNING asset_id, kind)"
                 " UPDATE assets SET status = 'failed', updated_at = now(),"
                 "  error = 'processing did not finish'"
-                " FROM dead WHERE assets.id = dead.asset_id"
+                " FROM dead WHERE assets.id = dead.asset_id AND dead.kind <> 'embed'"
             )
             rows = conn.execute(
                 "WITH next AS ("
@@ -116,7 +116,7 @@ class JobQueue:
                 conn.execute(
                     "UPDATE assets SET status = 'processing', updated_at = now()"
                     " WHERE id = ANY(%s) AND status = 'queued'",
-                    ([r[1] for r in rows],),
+                    ([r[1] for r in rows if r[2] != "embed"],),
                 )
         return [Job(*row) for row in rows]
 
@@ -147,13 +147,14 @@ class JobQueue:
         message = error[:ERROR_CHARS]
         with self._index.connection() as conn:
             row = conn.execute(
-                "SELECT attempts, max_attempts, asset_id FROM ingest_jobs"
+                "SELECT attempts, max_attempts, asset_id, kind FROM ingest_jobs"
                 " WHERE id = %s AND locked_by = %s AND state = 'running' FOR UPDATE",
                 (job_id, worker_id),
             ).fetchone()
             if row is None:
                 return "lost"
-            attempts, max_attempts, asset_id = row
+            attempts, max_attempts, asset_id, kind = row
+            tracks_asset = kind != "embed"  # an embedding failure must not fail the upload
             if retry and attempts < max_attempts:
                 conn.execute(
                     "UPDATE ingest_jobs SET state = 'queued', locked_by = NULL,"
@@ -162,20 +163,23 @@ class JobQueue:
                     " updated_at = now() WHERE id = %s",
                     (backoff_seconds(attempts, rng=rng), message, job_id),
                 )
-                conn.execute(
-                    "UPDATE assets SET status = 'queued', updated_at = now() WHERE id = %s",
-                    (asset_id,),
-                )
+                if tracks_asset:
+                    conn.execute(
+                        "UPDATE assets SET status = 'queued', updated_at = now() WHERE id = %s",
+                        (asset_id,),
+                    )
                 return "queued"
             conn.execute(
                 "UPDATE ingest_jobs SET state = 'dead', locked_by = NULL, locked_until = NULL,"
                 " last_error = %s, updated_at = now() WHERE id = %s",
                 (message, job_id),
             )
-            conn.execute(
-                "UPDATE assets SET status = 'failed', error = %s, updated_at = now() WHERE id = %s",
-                (message, asset_id),
-            )
+            if tracks_asset:
+                conn.execute(
+                    "UPDATE assets SET status = 'failed', error = %s, updated_at = now()"
+                    " WHERE id = %s",
+                    (message, asset_id),
+                )
             return "dead"
 
     def reroute(self, job_id: int, worker_id: str, kind: str) -> bool:

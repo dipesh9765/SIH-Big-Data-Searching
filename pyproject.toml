@@ -80,3 +80,7 @@ ignore_missing_imports = true  # no type stubs published
 [[tool.mypy.overrides]]
 module = ["faster_whisper", "av", "av.*"]
 ignore_missing_imports = true  # optional ASR dependencies; installed in the worker image only
+
+[[tool.mypy.overrides]]
+module = ["fastembed", "fastembed.*"]
+ignore_missing_imports = true  # optional semantic-search dependency
