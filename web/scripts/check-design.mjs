@@ -3,13 +3,18 @@
 // (https://github.com/nutlope/hallmark): the rules that can be verified by reading source.
 // It does not replace looking at the screen; it stops the common tells from coming back.
 //
-//   node scripts/check-design.mjs [dir ...]      (default: src)
+//   node scripts/check-design.mjs [--skip=rule,rule] [dir ...]      (default: src)
+//
+// A project may skip a rule it has a reason to break (for example inline-style where no CSP
+// forbids it); the skip belongs in that project's package.json script so it is visible.
 //
 // Exit status 1 when a rule is broken. A line may opt out with `/* design-ok: reason */`.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, extname, basename } from "node:path";
 
-const roots = process.argv.slice(2);
+const args = process.argv.slice(2);
+const skipped = new Set(args.filter((a) => a.startsWith("--skip=")).flatMap((a) => a.slice(7).split(",")));
+const roots = args.filter((a) => !a.startsWith("--"));
 if (roots.length === 0) roots.push("src");
 
 const TOKEN_FILES = new Set(["tokens.css"]);
@@ -52,7 +57,7 @@ for (const file of files) {
     for (const rule of rules) {
       if (rule.css && !isCss) continue;
       if (rule.jsx && isCss) continue;
-      if (rule.notIn?.has(name)) continue;
+      if (rule.notIn?.has(name) || skipped.has(rule.id)) continue;
       if (rule.re.test(line)) {
         console.log(`${file}:${i + 1}  ${rule.id}: ${rule.why}\n    ${line.trim().slice(0, 140)}`);
         failures += 1;
