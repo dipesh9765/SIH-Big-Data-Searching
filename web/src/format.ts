@@ -45,3 +45,14 @@ export function splitLastWord(text: string): { head: string; word: string } {
   const match = /^(.*?)(\S*)$/s.exec(text);
   return { head: match?.[1] ?? "", word: match?.[2] ?? "" };
 }
+
+/** "notes.final.PDF" -> "pdf": the file kind shown in the margin of a result. */
+export function fileKind(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot > 0 && dot < name.length - 1 ? name.slice(dot + 1).toLowerCase() : "file";
+}
+
+/** A short date for a list: "2026-10-30". */
+export function shortDate(iso: string): string {
+  return iso.slice(0, 10);
+}

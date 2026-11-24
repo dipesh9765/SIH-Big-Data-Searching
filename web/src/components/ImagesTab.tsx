@@ -10,7 +10,7 @@ interface Props {
 function Picture({ hit, client }: { hit: ImageHitOut; client: Api }) {
   const [src, setSrc] = useState<string | null>(null);
 
-  // A signed, short-lived URL, so an <img> can load a file that sits behind the API key.
+  // A signed, short-lived address, so an <img> can load a file that sits behind the API key.
   useEffect(() => {
     let current = true;
     client
@@ -26,10 +26,10 @@ function Picture({ hit, client }: { hit: ImageHitOut; client: Api }) {
 
   return (
     <figure className="picture">
-      {src !== null ? <img src={src} alt={hit.title} loading="lazy" /> : <div className="placeholder" />}
+      {src !== null ? <img src={src} alt={hit.title} loading="lazy" /> : <div className="blank" />}
       <figcaption>
         {hit.title}
-        <span className="meta"> · {(hit.similarity * 100).toFixed(0)}% match</span>
+        <span className="match">{(hit.similarity * 100).toFixed(0)}% match</span>
       </figcaption>
     </figure>
   );
@@ -49,29 +49,52 @@ export function ImagesTab({ client = api }: Props) {
     try {
       setHits(await client.searchImages(text.trim()));
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "Search failed.");
+      setError(failure instanceof Error ? failure.message : "The search failed.");
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <section aria-label="Image search">
-      <form onSubmit={(event) => void submit(event)} role="search" className="searchbar">
+    <section aria-labelledby="pictures-title">
+      <h1 id="pictures-title" className="page-title">Pictures</h1>
+      <p className="page-lede">Describe what is in the picture, in English.</p>
+      <form
+        onSubmit={(event) => {
+          void submit(event);
+        }}
+        role="search"
+        className="query"
+      >
         <input
+          className="field large"
           type="search"
           aria-label="Describe the picture"
-          placeholder="Describe a picture, in English: a red bus, snow on a mountain"
+          placeholder="A red bus, snow on a mountain"
           value={text}
-          onChange={(event) => { setText(event.target.value); }}
+          onChange={(event) => {
+            setText(event.target.value);
+          }}
         />
-        <button type="submit" disabled={busy || !text.trim()}>Find</button>
+        <button type="submit" className="button primary" disabled={busy || !text.trim()}>
+          Find
+        </button>
       </form>
-      {error !== null && <p className="error" role="alert">{error}</p>}
-      {hits !== null && hits.length === 0 && <p className="empty">No pictures indexed yet.</p>}
-      <div className="grid">
-        {hits?.map((hit) => <Picture key={hit.asset_id} hit={hit} client={client} />)}
-      </div>
+      {error !== null && (
+        <p className="notice error" role="alert">
+          {error}
+        </p>
+      )}
+      {hits !== null && hits.length === 0 && (
+        <p className="notice">No pictures have been indexed yet. Add some under Add files.</p>
+      )}
+      {hits !== null && hits.length > 0 && (
+        <div className="pictures">
+          {hits.map((hit) => (
+            <Picture key={hit.asset_id} hit={hit} client={client} />
+          ))}
+        </div>
+      )}
     </section>
   );
 }

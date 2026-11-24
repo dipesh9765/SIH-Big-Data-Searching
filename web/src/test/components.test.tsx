@@ -1,9 +1,19 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { useState } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../App";
-import { ApiError, keyStore, request, type Api, type AssetOut, type HitOut, type SearchOut } from "../api";
+import {
+  ApiError,
+  keyStore,
+  request,
+  type Api,
+  type AssetOut,
+  type HitOut,
+  type Ranking,
+  type SearchOut,
+} from "../api";
 import { LibraryTab } from "../components/LibraryTab";
 import { MediaPlayer } from "../components/MediaPlayer";
 import { SearchTab } from "../components/SearchTab";
@@ -74,34 +84,110 @@ function asset(overrides: Partial<AssetOut> = {}): AssetOut {
   };
 }
 
+/** Stands in for the app shell: the address bar decides what is searched. */
+function Harness({ client, semantic = false, start = "" }: { client: Api; semantic?: boolean; start?: string }) {
+  const [place, setPlace] = useState<{ q: string; ranking: Ranking }>({ q: start, ranking: "keyword" });
+  return (
+    <SearchTab
+      key={`${place.q}\u0000${place.ranking}`}
+      q={place.q}
+      ranking={place.ranking}
+      semantic={semantic}
+      onSearch={(q, ranking) => {
+        setPlace({ q, ranking });
+      }}
+      client={client}
+      suggestDelay={0}
+    />
+  );
+}
+
+async function ask(text: string): Promise<void> {
+  await userEvent.type(screen.getByLabelText("Search query"), text);
+  await userEvent.keyboard("{Enter}");
+}
+
 describe("SearchTab", () => {
-  it("searches, highlights the match and shows the summary", async () => {
-    const client = fakeApi({ search: vi.fn().mockResolvedValue(result([hit()])) });
-    render(<SearchTab semantic={false} client={client} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "glacier");
-    await userEvent.click(screen.getByRole("button", { name: "Search" }));
-    const card = await screen.findByRole("heading", { name: "Glacier report" });
-    expect(card).toBeInTheDocument();
-    expect(screen.getByText("glacier", { selector: "mark" })).toBeInTheDocument();
-    expect(client.search).toHaveBeenCalledWith("glacier", "keyword", 0, 10);
-    expect(screen.getByText(/1 result for “glacier”/)).toBeInTheDocument();
+  it("shows ways to narrow a search before anything is asked", () => {
+    render(<Harness client={fakeApi()} />);
+    expect(screen.getByRole("button", { name: '"exact phrase"' })).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: /entries/i })).not.toBeInTheDocument();
   });
 
-  it("offers a correction when nothing matched and runs it on click", async () => {
+  it("puts an example into the box when it is clicked", async () => {
+    render(<Harness client={fakeApi()} />);
+    await userEvent.click(screen.getByRole("button", { name: "solar OR wind" }));
+    expect(screen.getByLabelText("Search query")).toHaveValue("solar OR wind");
+  });
+
+  it("searches, highlights the match and says how many were found", async () => {
+    const client = fakeApi({ search: vi.fn().mockResolvedValue(result([hit()])) });
+    render(<Harness client={client} />);
+    await ask("glacier");
+    expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
+    expect(screen.getByText("glacier", { selector: "mark" })).toBeInTheDocument();
+    expect(client.search).toHaveBeenCalledWith("glacier", "keyword", 0, 10);
+    expect(screen.getByText(/Showing 1 match for “glacier”, found in 4 ms/)).toBeInTheDocument();
+  });
+
+  it("shows the file kind in the margin of a document and the moment for a recording", async () => {
+    const media = { asset_id: 9, kind: "transcript", start_ms: 83_000, end_ms: 99_000, file_url: "/x" };
+    const spoken = hit({
+      media,
+      document: { ...hit().document, id: 2, title: "Keynote", source_name: "keynote.mp3", media_type: "audio/mpeg" },
+    });
+    render(<Harness client={fakeApi({ search: vi.fn().mockResolvedValue(result([hit(), spoken])) })} />);
+    await ask("glacier");
+    await screen.findByRole("heading", { name: "Keynote" });
+    const entries = screen.getAllByRole("listitem").filter((li) => li.className === "entry");
+    expect(within(entries[0] as HTMLElement).getByText("txt")).toBeInTheDocument();
+    expect(within(entries[1] as HTMLElement).getByText("1:23")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Play from 1:23" })).toBeInTheDocument();
+  });
+
+  it("draws a loading state while the answer is on its way", async () => {
+    let finish: (value: SearchOut) => void = () => undefined;
+    const search = vi.fn().mockReturnValue(new Promise<SearchOut>((resolve) => { finish = resolve; }));
+    render(<Harness client={fakeApi({ search })} />);
+    await ask("glacier");
+    expect(await screen.findByText("Searching")).toBeInTheDocument();
+    await act(async () => {
+      finish(result([hit()]));
+      await Promise.resolve();
+    });
+    expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
+    expect(screen.queryByText("Searching")).not.toBeInTheDocument();
+  });
+
+  it("says what to do when nothing matches, and offers a correction that runs on click", async () => {
     const search = vi
       .fn()
       .mockResolvedValueOnce(result([], { did_you_mean: "glacier" }))
       .mockResolvedValueOnce(result([hit()]));
-    render(<SearchTab semantic={false} client={fakeApi({ search })} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "glaicer{enter}");
-    await userEvent.click(await screen.findByRole("button", { name: "glacier" }));
+    render(<Harness client={fakeApi({ search })} />);
+    await ask("glaicer");
+    expect(await screen.findByText(/Nothing matches/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "glacier" }));
     expect(search).toHaveBeenLastCalledWith("glacier", "keyword", 0, 10);
     expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
   });
 
-  it("shows autocomplete suggestions and completes the last word with the keyboard", async () => {
+  it("explains a failure and tries again on request", async () => {
+    const search = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiError(422, "after: expects a date like 2025-01-31"))
+      .mockResolvedValueOnce(result([hit()]));
+    render(<Harness client={fakeApi({ search })} />);
+    await ask("x after:bad");
+    expect(await screen.findByRole("alert")).toHaveTextContent("expects a date");
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it("suggests words while typing and completes the last one with the keyboard", async () => {
     const suggest = vi.fn().mockResolvedValue(["glacier", "glaciers"]);
-    render(<SearchTab semantic={false} client={fakeApi({ suggest })} suggestDelay={0} />);
+    render(<Harness client={fakeApi({ suggest })} />);
     const box = screen.getByLabelText("Search query");
     await userEvent.type(box, "solar gla");
     const list = await screen.findByRole("listbox");
@@ -111,43 +197,51 @@ describe("SearchTab", () => {
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
   });
 
-  it("does not ask for suggestions for one letter", async () => {
+  it("does not open suggestions for a query that arrived in the address", async () => {
+    const suggest = vi.fn().mockResolvedValue(["glacier"]);
+    render(<Harness client={fakeApi({ suggest })} start="glaicer" />);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(suggest).not.toHaveBeenCalled();
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("does not ask for suggestions for a single letter", async () => {
     const suggest = vi.fn().mockResolvedValue(["x"]);
-    render(<SearchTab semantic={false} client={fakeApi({ suggest })} suggestDelay={0} />);
+    render(<Harness client={fakeApi({ suggest })} />);
     await userEvent.type(screen.getByLabelText("Search query"), "g");
     expect(suggest).not.toHaveBeenCalled();
   });
 
-  it("only offers the ranking choice when the server supports it", () => {
-    const { rerender } = render(<SearchTab semantic={false} client={fakeApi()} suggestDelay={0} />);
+  it("offers the choice of ranking only when the server supports it", () => {
+    const { unmount } = render(<Harness client={fakeApi()} />);
     expect(screen.queryByLabelText("Ranking")).not.toBeInTheDocument();
-    rerender(<SearchTab semantic client={fakeApi()} suggestDelay={0} />);
+    unmount();
+    render(<Harness client={fakeApi()} semantic />);
     expect(screen.getByLabelText("Ranking")).toBeInTheDocument();
   });
 
-  it("passes the chosen ranking to the server", async () => {
+  it("sends the chosen ranking to the server", async () => {
     const client = fakeApi({ search: vi.fn().mockResolvedValue(result([hit()])) });
-    render(<SearchTab semantic client={client} suggestDelay={0} />);
+    render(<Harness client={client} semantic />);
     await userEvent.selectOptions(screen.getByLabelText("Ranking"), "hybrid");
-    await userEvent.type(screen.getByLabelText("Search query"), "water{enter}");
-    await waitFor(() => { expect(client.search).toHaveBeenCalledWith("water", "hybrid", 0, 10); });
+    await ask("water");
+    await waitFor(() => {
+      expect(client.search).toHaveBeenCalledWith("water", "hybrid", 0, 10);
+    });
   });
 
-  it("reports errors from the server", async () => {
-    const search = vi.fn().mockRejectedValue(new ApiError(422, "after: expects a date like 2025-01-31"));
-    render(<SearchTab semantic={false} client={fakeApi({ search })} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "x after:bad{enter}");
-    expect(await screen.findByRole("alert")).toHaveTextContent("expects a date");
-  });
-
-  it("loads the next page when a full page came back", async () => {
-    const page = (start: number) =>
-      result(Array.from({ length: 10 }, (_, i) => hit({ document: { ...hit().document, id: start + i, title: `Doc ${String(start + i)}` } })));
+  it("shows more results when a full page came back", async () => {
+    const page = (start: number): SearchOut =>
+      result(
+        Array.from({ length: 10 }, (_, i) =>
+          hit({ document: { ...hit().document, id: start + i, title: `Doc ${String(start + i)}` } }),
+        ),
+      );
     const search = vi.fn().mockResolvedValueOnce(page(0)).mockResolvedValueOnce(page(10));
-    render(<SearchTab semantic={false} client={fakeApi({ search })} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "doc{enter}");
+    render(<Harness client={fakeApi({ search })} />);
+    await ask("doc");
     await screen.findByRole("heading", { name: "Doc 0" });
-    await userEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show more" }));
     expect(await screen.findByRole("heading", { name: "Doc 19" })).toBeInTheDocument();
     expect(search).toHaveBeenLastCalledWith("doc", "keyword", 10, 10);
     expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(20);
@@ -155,41 +249,35 @@ describe("SearchTab", () => {
 
   it("renders document text as text, never as markup", async () => {
     const evil = hit({ snippet: "<img src=x onerror=alert(1)> glacier", highlights: [[29, 36]] });
-    const client = fakeApi({ search: vi.fn().mockResolvedValue(result([evil])) });
-    const { container } = render(<SearchTab semantic={false} client={client} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "glacier{enter}");
+    const { container } = render(<Harness client={fakeApi({ search: vi.fn().mockResolvedValue(result([evil])) })} />);
+    await ask("glacier");
     await screen.findByRole("heading", { name: "Glacier report" });
     expect(container.querySelector("img")).toBeNull();
     expect(container.textContent).toContain("<img src=x onerror=alert(1)> glacier");
     expect(screen.getByText("glacier", { selector: "mark" })).toBeInTheDocument();
   });
-
-  it("shows a play button for a hit inside a recording", async () => {
-    const media = { asset_id: 9, kind: "transcript", start_ms: 83_000, end_ms: 99_000, file_url: "/x" };
-    const client = fakeApi({
-      search: vi.fn().mockResolvedValue(
-        result([hit({ media, document: { ...hit().document, media_type: "audio/mpeg" } })]),
-      ),
-    });
-    render(<SearchTab semantic={false} client={client} suggestDelay={0} />);
-    await userEvent.type(screen.getByLabelText("Search query"), "glacier{enter}");
-    expect(await screen.findByRole("button", { name: /Play from 1:23/ })).toBeInTheDocument();
-  });
 });
 
 describe("MediaPlayer", () => {
-  it("loads a signed URL and renders an audio or video element", async () => {
+  it("loads a signed address and shows an audio or video element", async () => {
     const client = fakeApi();
-    const { container, rerender } = render(
-      <MediaPlayer assetId={9} mediaType="audio/mpeg" startMs={5000} client={client} />,
-    );
-    await userEvent.click(screen.getByRole("button", { name: /Play from 0:05/ }));
-    await waitFor(() => { expect(container.querySelector("audio")).not.toBeNull(); });
+    const { container } = render(<MediaPlayer assetId={9} mediaType="audio/mpeg" startMs={5000} client={client} />);
+    await userEvent.click(screen.getByRole("button", { name: "Play from 0:05" }));
+    await waitFor(() => {
+      expect(container.querySelector("audio")).not.toBeNull();
+    });
     expect(container.querySelector("audio")?.getAttribute("src")).toBe("/v1/assets/9/file?token=abc");
-    rerender(<MediaPlayer assetId={10} mediaType="video/mp4" startMs={0} client={client} />);
   });
 
-  it("shows why it could not load", async () => {
+  it("uses a video element for video", async () => {
+    const { container } = render(<MediaPlayer assetId={9} mediaType="video/mp4" startMs={0} client={fakeApi()} />);
+    await userEvent.click(screen.getByRole("button"));
+    await waitFor(() => {
+      expect(container.querySelector("video")).not.toBeNull();
+    });
+  });
+
+  it("says why it could not load", async () => {
     const client = fakeApi({ fileUrl: vi.fn().mockRejectedValue(new Error("asset not found")) });
     render(<MediaPlayer assetId={9} mediaType="video/mp4" startMs={0} client={client} />);
     await userEvent.click(screen.getByRole("button"));
@@ -208,65 +296,97 @@ describe("UploadTab", () => {
     const file = new File(["hello"], "notes.txt", { type: "text/plain" });
     await userEvent.upload(screen.getByLabelText("Choose files to upload"), file);
     expect(upload).toHaveBeenCalledWith(file);
-    expect(await screen.findByText("indexed")).toBeInTheDocument();
-    expect(screen.getByText(/3 segments · 1:01 · en · OCR confidence 95%/)).toBeInTheDocument();
+    expect(await screen.findByText("Searchable")).toBeInTheDocument();
+    expect(screen.getByText("3 passages, 1:01 long, language en, scan read at 95% confidence")).toBeInTheDocument();
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("starts with an empty state that says what will appear", () => {
+    render(<UploadTab accepted={[]} client={fakeApi()} />);
+    expect(screen.getByText(/Nothing added in this visit/)).toBeInTheDocument();
   });
 
   it("shows the server's reason when a file is refused", async () => {
     const upload = vi.fn().mockRejectedValue(new ApiError(415, "unsupported file type '.exe'"));
     render(<UploadTab accepted={[]} client={fakeApi({ upload })} pollInterval={10} />);
     await userEvent.upload(screen.getByLabelText("Choose files to upload"), new File(["x"], "tool.exe"));
-    expect(await screen.findByText("refused")).toBeInTheDocument();
+    expect(await screen.findByText("Not accepted")).toBeInTheDocument();
     expect(screen.getByText(/unsupported file type/)).toBeInTheDocument();
   });
 
-  it("reports a failed file with its reason", async () => {
+  it("reports a file that could not be read, with the reason", async () => {
     const upload = vi.fn().mockResolvedValue({ asset_id: 6, job_id: 2, status: "queued", duplicate: false });
     const poll = vi.fn().mockResolvedValue(asset({ status: "failed", error: "unreadable PDF" }));
     render(<UploadTab accepted={[]} client={fakeApi({ upload, asset: poll })} pollInterval={10} />);
     await userEvent.upload(screen.getByLabelText("Choose files to upload"), new File(["x"], "bad.pdf"));
-    expect(await screen.findByText("failed")).toBeInTheDocument();
+    expect(await screen.findByText("Could not read it")).toBeInTheDocument();
     expect(screen.getByText("unreadable PDF")).toBeInTheDocument();
   });
 
-  it("says when a file was uploaded before", async () => {
+  it("says when the same file was added before", async () => {
     const upload = vi.fn().mockResolvedValue({ asset_id: 5, job_id: null, status: "indexed", duplicate: true });
     render(<UploadTab accepted={[]} client={fakeApi({ upload })} pollInterval={10} />);
     await userEvent.upload(screen.getByLabelText("Choose files to upload"), new File(["x"], "again.txt"));
-    expect(await screen.findByText("already uploaded")).toBeInTheDocument();
+    expect(await screen.findByText("These exact bytes were added before.")).toBeInTheDocument();
   });
 });
 
 describe("LibraryTab", () => {
-  it("lists uploads and deletes one after confirmation", async () => {
-    const assets = vi.fn().mockResolvedValue([asset(), asset({ asset_id: 6, title: "broken.pdf", status: "failed", error: "unreadable PDF" })]);
-    const deleteAsset = vi.fn().mockResolvedValue(undefined);
-    const confirm = vi.fn().mockReturnValue(true);
-    render(<LibraryTab client={fakeApi({ assets, deleteAsset })} confirm={confirm} />);
-    expect(await screen.findByText("broken.pdf")).toBeInTheDocument();
+  const two = [
+    asset(),
+    asset({ asset_id: 6, title: "broken.pdf", status: "failed", error: "unreadable PDF" }),
+  ];
+
+  it("lists what was added, in a table, with the reason for a failure", async () => {
+    render(<LibraryTab client={fakeApi({ assets: vi.fn().mockResolvedValue(two) })} />);
+    expect(await screen.findByRole("table")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Name" })).toBeInTheDocument();
+    expect(screen.getByText("broken.pdf")).toBeInTheDocument();
     expect(screen.getByText("unreadable PDF")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Delete scan.pdf" }));
-    expect(confirm).toHaveBeenCalled();
+    expect(screen.getAllByText("2.0 KB")).toHaveLength(2);
+  });
+
+  it("asks before deleting, then deletes", async () => {
+    const deleteAsset = vi.fn().mockResolvedValue(undefined);
+    render(<LibraryTab client={fakeApi({ assets: vi.fn().mockResolvedValue(two), deleteAsset })} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Delete scan.pdf" }));
+    expect(deleteAsset).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Delete for good" }));
     expect(deleteAsset).toHaveBeenCalledWith(5);
-    await waitFor(() => { expect(screen.queryByText("scan.pdf")).not.toBeInTheDocument(); });
+    await waitFor(() => {
+      expect(screen.queryByText("scan.pdf")).not.toBeInTheDocument();
+    });
     expect(screen.getByText("broken.pdf")).toBeInTheDocument();
   });
 
-  it("does nothing when the deletion is declined", async () => {
+  it("keeps the file when the user changes their mind", async () => {
     const deleteAsset = vi.fn();
-    render(<LibraryTab client={fakeApi({ assets: vi.fn().mockResolvedValue([asset()]), deleteAsset })} confirm={() => false} />);
+    render(<LibraryTab client={fakeApi({ assets: vi.fn().mockResolvedValue([asset()]), deleteAsset })} />);
     await userEvent.click(await screen.findByRole("button", { name: "Delete scan.pdf" }));
+    await userEvent.click(screen.getByRole("button", { name: "Keep it" }));
     expect(deleteAsset).not.toHaveBeenCalled();
-    expect(screen.getByText("scan.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete scan.pdf" })).toBeInTheDocument();
   });
 
-  it("filters by status", async () => {
+  it("shows an empty state that points at the next step", async () => {
+    render(<LibraryTab client={fakeApi()} />);
+    expect(await screen.findByText(/Nothing has been added yet/)).toBeInTheDocument();
+  });
+
+  it("filters by state", async () => {
     const assets = vi.fn().mockResolvedValue([]);
     render(<LibraryTab client={fakeApi({ assets })} />);
-    await screen.findByText("Nothing here yet.");
+    await screen.findByText(/Nothing has been added yet/);
     await userEvent.selectOptions(screen.getByRole("combobox"), "failed");
-    await waitFor(() => { expect(assets).toHaveBeenLastCalledWith("failed"); });
+    await waitFor(() => {
+      expect(assets).toHaveBeenLastCalledWith("failed");
+    });
+    expect(await screen.findByText("Nothing in this state.")).toBeInTheDocument();
+  });
+
+  it("reports a load failure", async () => {
+    render(<LibraryTab client={fakeApi({ assets: vi.fn().mockRejectedValue(new Error("database unavailable")) })} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("database unavailable");
   });
 });
 
@@ -283,25 +403,58 @@ describe("App", () => {
     semantic: true,
   };
 
-  it("shows index status and the image tab when semantic search is on", async () => {
-    render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats) })} />);
-    expect(await screen.findByText(/1,200 documents · 45,000 terms · 3 jobs in progress/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Images" })).toBeInTheDocument();
+  afterEach(() => {
+    window.history.replaceState(null, "", "/");
   });
 
-  it("hides the image tab without semantic search", async () => {
+  it("says how big the index is and how much is being read", async () => {
+    render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats) })} />);
+    expect(await screen.findByText("1,200 documents indexed, 3 files being read")).toBeInTheDocument();
+  });
+
+  it("shows the pictures tab only when semantic search is on", async () => {
+    const { unmount } = render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats) })} />);
+    expect(await screen.findByRole("button", { name: "Pictures" })).toBeInTheDocument();
+    unmount();
     render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue({ ...stats, semantic: false }) })} />);
-    await screen.findByText(/documents/);
-    expect(screen.queryByRole("button", { name: "Images" })).not.toBeInTheDocument();
+    await screen.findByText(/documents indexed/);
+    expect(screen.queryByRole("button", { name: "Pictures" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the search in the address bar and runs it when the page is opened with one", async () => {
+    window.history.replaceState(null, "", "/?q=glacier");
+    const search = vi.fn().mockResolvedValue(result([hit()]));
+    render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats), search })} />);
+    expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
+    expect(search).toHaveBeenCalledWith("glacier", "keyword", 0, 10);
+    expect(screen.getByLabelText("Search query")).toHaveValue("glacier");
+  });
+
+  it("writes a new search to the address bar and follows Back", async () => {
+    const search = vi.fn().mockResolvedValue(result([hit()]));
+    render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats), search })} />);
+    await screen.findByText(/documents indexed/);
+    await ask("glacier");
+    await screen.findByRole("heading", { name: "Glacier report" });
+    expect(window.location.search).toBe("?q=glacier");
+    await userEvent.click(screen.getByRole("button", { name: "Library" }));
+    expect(window.location.search).toBe("?tab=library&q=glacier");
+    act(() => {
+      window.history.back();
+    });
+    await waitFor(() => {
+      expect(window.location.search).toBe("?q=glacier");
+    });
+    expect(await screen.findByRole("heading", { name: "Glacier report" })).toBeInTheDocument();
   });
 
   it("asks for the API key when the server refuses, and unlocks with it", async () => {
-    const fetchStats = vi
+    const stat = vi
       .fn()
       .mockRejectedValueOnce(new ApiError(401, "missing or invalid API key"))
       .mockResolvedValue(stats);
-    render(<App client={fakeApi({ stats: fetchStats })} />);
-    const field = await screen.findByLabelText(/needs an API key/);
+    render(<App client={fakeApi({ stats: stat })} />);
+    const field = await screen.findByLabelText("API key");
     await userEvent.type(field, "s3cret");
     await userEvent.click(screen.getByRole("button", { name: "Unlock" }));
     expect(await screen.findByRole("navigation", { name: "Sections" })).toBeInTheDocument();
@@ -313,12 +466,13 @@ describe("App", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Failed to fetch");
   });
 
-  it("switches tabs", async () => {
+  it("moves between sections and marks the current one", async () => {
     render(<App client={fakeApi({ stats: vi.fn().mockResolvedValue(stats) })} />);
-    await userEvent.click(await screen.findByRole("button", { name: "Upload" }));
-    expect(screen.getByRole("region", { name: "Upload" })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: "Add files" }));
+    expect(screen.getByRole("heading", { name: "Add files" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add files" })).toHaveAttribute("aria-current", "page");
     await userEvent.click(screen.getByRole("button", { name: "Library" }));
-    expect(screen.getByRole("region", { name: "Library" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Library" })).toBeInTheDocument();
   });
 });
 

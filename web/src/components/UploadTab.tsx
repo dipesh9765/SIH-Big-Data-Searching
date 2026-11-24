@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent } from "react";
 
-import { api, ApiError, type Api, type AssetOut } from "../api";
+import { api, type Api, type AssetOut } from "../api";
 import { formatBytes, formatClock } from "../format";
 
 type Stage = "uploading" | "refused" | "queued" | "processing" | "indexed" | "failed";
@@ -13,30 +13,38 @@ interface Item {
   stage: Stage;
   assetId: number | null;
   detail: string;
-  asset: AssetOut | null;
 }
 
 interface Props {
   accepted: string[];
   client?: Api;
-  /** How often to ask where each upload is, in milliseconds. */
+  /** How often to ask where each file is, in milliseconds. */
   pollInterval?: number;
 }
 
-const TERMINAL: Stage[] = ["refused", "indexed", "failed"];
+const DONE: Stage[] = ["refused", "indexed", "failed"];
+
+const WORDS: Record<Stage, { text: string; tone: "good" | "bad" | "wait" }> = {
+  uploading: { text: "Uploading", tone: "wait" },
+  queued: { text: "Waiting for a worker", tone: "wait" },
+  processing: { text: "Reading the file", tone: "wait" },
+  indexed: { text: "Searchable", tone: "good" },
+  failed: { text: "Could not read it", tone: "bad" },
+  refused: { text: "Not accepted", tone: "bad" },
+};
 
 function describe(asset: AssetOut): string {
   const parts: string[] = [];
-  if (asset.units > 1) parts.push(`${String(asset.units)} segments`);
-  if (asset.duration_ms !== null) parts.push(formatClock(asset.duration_ms));
-  if (asset.language) parts.push(asset.language);
-  if (asset.ocr_confidence !== null) parts.push(`OCR confidence ${asset.ocr_confidence.toFixed(0)}%`);
-  return parts.join(" · ");
+  if (asset.units > 1) parts.push(`${String(asset.units)} passages`);
+  if (asset.duration_ms !== null) parts.push(`${formatClock(asset.duration_ms)} long`);
+  if (asset.language) parts.push(`language ${asset.language}`);
+  if (asset.ocr_confidence !== null) parts.push(`scan read at ${asset.ocr_confidence.toFixed(0)}% confidence`);
+  return parts.join(", ");
 }
 
 export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props) {
   const [items, setItems] = useState<Item[]>([]);
-  const [hover, setHover] = useState(false);
+  const [over, setOver] = useState(false);
   const counter = useRef(0);
   const input = useRef<HTMLInputElement | null>(null);
 
@@ -51,13 +59,10 @@ export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props
         patch(key, {
           stage: result.status,
           assetId: result.asset_id,
-          detail: result.duplicate && result.job_id === null ? "already uploaded" : "",
+          detail: result.duplicate && result.job_id === null ? "These exact bytes were added before." : "",
         });
       } catch (failure) {
-        patch(key, {
-          stage: "refused",
-          detail: failure instanceof ApiError || failure instanceof Error ? failure.message : "failed",
-        });
+        patch(key, { stage: "refused", detail: failure instanceof Error ? failure.message : "Upload failed." });
       }
     },
     [client, patch],
@@ -72,7 +77,6 @@ export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props
       stage: "uploading",
       assetId: null,
       detail: "",
-      asset: null,
     }));
     setItems((current) => [...fresh, ...current]);
     fresh.forEach((item, index) => {
@@ -82,28 +86,30 @@ export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props
   }
 
   useEffect(() => {
-    const waiting = items.filter((i) => !TERMINAL.includes(i.stage) && i.assetId !== null);
+    const waiting = items.filter((item) => !DONE.includes(item.stage) && item.assetId !== null);
     if (waiting.length === 0) return;
     const timer = setInterval(() => {
       for (const item of waiting) {
         if (item.assetId === null) continue;
         client
           .asset(item.assetId)
-          .then((asset) => { patch(item.key, {
+          .then((asset) => {
+            patch(item.key, {
               stage: asset.status,
-              asset,
-              detail: asset.status === "failed" ? (asset.error ?? "failed") : describe(asset),
-            }); },
-          )
+              detail: asset.status === "failed" ? (asset.error ?? "") : describe(asset),
+            });
+          })
           .catch(() => undefined); // a poll that fails is simply tried again
       }
     }, pollInterval);
-    return () => { clearInterval(timer); };
+    return () => {
+      clearInterval(timer);
+    };
   }, [items, client, patch, pollInterval]);
 
   function drop(event: DragEvent): void {
     event.preventDefault();
-    setHover(false);
+    setOver(false);
     add(event.dataTransfer.files);
   }
 
@@ -113,18 +119,29 @@ export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props
   }
 
   return (
-    <section aria-label="Upload">
+    <section aria-labelledby="add-title">
+      <h1 id="add-title" className="page-title">Add files</h1>
+      <p className="page-lede">
+        Documents, scans, pictures, audio and video. Each file is read in the background; you can search it
+        as soon as it says searchable.
+      </p>
       <div
-        className={hover ? "drop over" : "drop"}
+        className={over ? "dropzone over" : "dropzone"}
         onDragOver={(event) => {
           event.preventDefault();
-          setHover(true);
+          setOver(true);
         }}
-        onDragLeave={() => { setHover(false); }}
+        onDragLeave={() => {
+          setOver(false);
+        }}
         onDrop={drop}
       >
-        <p>Drop files here, or</p>
-        <button type="button" onClick={() => input.current?.click()}>
+        <p>Drop files here, or choose them from your computer.</p>
+        <button
+          type="button"
+          className="button primary"
+          onClick={() => input.current?.click()}
+        >
           Choose files
         </button>
         <input
@@ -136,19 +153,28 @@ export function UploadTab({ accepted, client = api, pollInterval = 1500 }: Props
           accept={accepted.join(",")}
           onChange={pick}
         />
-        {accepted.length > 0 && <p className="meta">Accepted: {accepted.join(" ")}</p>}
+        {accepted.length > 0 && <p className="index-size">Accepted: {accepted.join(" ")}</p>}
       </div>
 
-      <ul className="uploads">
-        {items.map((item) => (
-          <li key={item.key} className={`upload ${item.stage}`}>
-            <span className="name">{item.name}</span>
-            <span className="meta">{formatBytes(item.size)}</span>
-            <span className={`badge ${item.stage}`}>{item.stage}</span>
-            {item.detail && <span className="detail">{item.detail}</span>}
-          </li>
-        ))}
-      </ul>
+      {items.length === 0 ? (
+        <p className="notice">Nothing added in this visit. Files you add appear here with their progress.</p>
+      ) : (
+        <ul className="queue" aria-label="Files added">
+          {items.map((item) => {
+            const word = WORDS[item.stage];
+            return (
+              <li key={item.key}>
+                <span className="name">
+                  {item.name}
+                  <span className="size">{formatBytes(item.size)}</span>
+                </span>
+                <span className={`state ${word.tone}`}>{word.text}</span>
+                <span className="detail">{item.detail}</span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </section>
   );
 }

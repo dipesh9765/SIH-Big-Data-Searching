@@ -8,7 +8,9 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:design": "node scripts/check-design.mjs src",
+    "check": "npm run lint && npm run typecheck && npm run check:design && npm test"
   },
   "dependencies": {
     "react": "^19.3.1",

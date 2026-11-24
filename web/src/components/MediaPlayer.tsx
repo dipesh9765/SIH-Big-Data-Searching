@@ -10,7 +10,7 @@ interface Props {
   client?: Api;
 }
 
-/** A play button that loads the recording and starts at the moment the hit was spoken. */
+/** Loads the recording on request and starts it at the moment the hit was spoken. */
 export function MediaPlayer({ assetId, mediaType, startMs, client = api }: Props) {
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -23,7 +23,7 @@ export function MediaPlayer({ assetId, mediaType, startMs, client = api }: Props
     try {
       setUrl(await client.fileUrl(assetId));
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : "Could not load the recording.");
+      setError(failure instanceof Error ? failure.message : "The recording could not be loaded.");
     }
   }
 
@@ -36,27 +36,28 @@ export function MediaPlayer({ assetId, mediaType, startMs, client = api }: Props
 
   if (url === null) {
     return (
-      <div className="media">
-        <button type="button" className="play" onClick={() => void open()}>
-          ▶ Play from {formatClock(startMs ?? 0)}
+      <>
+        <button
+          type="button"
+          className="button"
+          onClick={() => {
+            void open();
+          }}
+        >
+          Play from {formatClock(startMs ?? 0)}
         </button>
-        {error !== null && <span className="error" role="alert">{error}</span>}
-      </div>
+        {error !== null && (
+          <p className="notice error" role="alert">
+            {error}
+          </p>
+        )}
+      </>
     );
   }
-  const common = {
-    controls: true,
-    src: url,
-    onLoadedMetadata: seek,
-    preload: "metadata" as const,
-  };
-  return (
-    <div className="media">
-      {isVideo ? (
-        <video ref={element as React.RefObject<HTMLVideoElement>} {...common} />
-      ) : (
-        <audio ref={element} {...common} />
-      )}
-    </div>
+  const common = { controls: true, src: url, onLoadedMetadata: seek, preload: "metadata" as const };
+  return isVideo ? (
+    <video ref={element as React.RefObject<HTMLVideoElement>} {...common} />
+  ) : (
+    <audio ref={element} {...common} />
   );
 }

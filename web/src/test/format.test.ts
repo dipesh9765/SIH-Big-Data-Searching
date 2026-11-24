@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatBytes, formatClock, segments, splitLastWord } from "../format";
+import { fileKind, formatBytes, formatClock, segments, shortDate, splitLastWord } from "../format";
 
 describe("formatClock", () => {
   it("formats minutes and seconds", () => {
@@ -61,5 +61,18 @@ describe("splitLastWord", () => {
     expect(splitLastWord("solar ")).toEqual({ head: "solar ", word: "" });
     expect(splitLastWord("single")).toEqual({ head: "", word: "single" });
     expect(splitLastWord("")).toEqual({ head: "", word: "" });
+  });
+});
+
+describe("fileKind and shortDate", () => {
+  it("names a file by its extension, in lower case", () => {
+    expect(fileKind("Report.FINAL.PDF")).toBe("pdf");
+    expect(fileKind("notes.txt")).toBe("txt");
+    expect(fileKind("README")).toBe("file");
+    expect(fileKind(".env")).toBe("file");
+    expect(fileKind("trailing.")).toBe("file");
+  });
+  it("keeps the date part of a timestamp", () => {
+    expect(shortDate("2026-10-30T10:00:00+00:00")).toBe("2026-10-30");
   });
 });
